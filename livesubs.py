@@ -19,6 +19,7 @@ Controls:
 """
 
 import argparse
+import os
 import queue
 import signal
 import sys
@@ -32,6 +33,34 @@ from scipy.signal import resample_poly
 
 WHISPER_SR = 16000
 BG = "#101010"
+
+os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
+
+
+def add_nvidia_dll_dirs():
+    """Make DLLs from the pip packages nvidia-cublas-cu12 / nvidia-cudnn-cu12 findable."""
+    if sys.platform != "win32":
+        return
+    import site
+
+    roots = list(site.getsitepackages())
+    try:
+        roots.append(site.getusersitepackages())
+    except Exception:
+        pass
+    for root in roots:
+        base = os.path.join(root, "nvidia")
+        if not os.path.isdir(base):
+            continue
+        for pkg in os.listdir(base):
+            for sub in ("bin", "lib"):
+                d = os.path.join(base, pkg, sub)
+                if os.path.isdir(d):
+                    try:
+                        os.add_dll_directory(d)
+                    except Exception:
+                        pass
+                    os.environ["PATH"] = d + os.pathsep + os.environ.get("PATH", "")
 
 # Things Whisper likes to "hear" in near-silence / music.
 HALLUCINATIONS = {
@@ -116,11 +145,17 @@ class Translator(threading.Thread):
         compute = "float16" if device == "cuda" else "int8"
         self.ui_q.put(("status", f"Loading {name} on {device.upper()}..."))
         try:
-            return WhisperModel(name, device=device, compute_type=compute), name, device
+            model = WhisperModel(name, device=device, compute_type=compute)
+            if device == "cuda":
+                # GPU libraries only load on first use, so test them now.
+                segs, _ = model.transcribe(np.zeros(WHISPER_SR, dtype=np.float32), language="en")
+                list(segs)
+            return model, name, device
         except Exception as e:
             if device != "cuda":
                 raise
-            print(f"CUDA load failed ({e}); falling back to CPU.")
+            print(f"GPU failed ({e}); falling back to CPU.\n"
+                  "  To use your GPU, run: py -V:3.12 -m pip install nvidia-cublas-cu12 nvidia-cudnn-cu12==9.*")
             name = a.model or "small"
             self.ui_q.put(("status", f"GPU failed, loading {name} on CPU..."))
             return WhisperModel(name, device="cpu", compute_type="int8"), name, "cpu"
@@ -332,6 +367,7 @@ def parse_args():
 
 def main():
     args = parse_args()
+    add_nvidia_dll_dirs()
     if sys.platform == "win32":
         try:  # crisp text on high-DPI screens
             import ctypes
