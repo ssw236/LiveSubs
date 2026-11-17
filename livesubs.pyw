@@ -666,23 +666,46 @@ def open_capture(cfg, on_error=log):
 # --------------------------------------------------------------------------
 # Speech -> text engines
 # --------------------------------------------------------------------------
-def download(url, dest, status, label):
+def download(url, dest, status, label, attempts=5):
+    """Downloads with a progress %, and resumes from where it stopped if the connection drops."""
     tmp = dest + ".part"
-    with urllib.request.urlopen(url, timeout=60) as r, open(tmp, "wb") as f:
-        total = int(r.headers.get("Content-Length") or 0)
-        done, last = 0, -1
-        while True:
-            chunk = r.read(1 << 20)
-            if not chunk:
-                break
-            f.write(chunk)
-            done += len(chunk)
-            if total:
-                pct = done * 100 // total
-                if pct // 5 != last // 5:
-                    last = pct
-                    status(f"Downloading {label}... {pct}%")
-    os.replace(tmp, dest)
+    for attempt in range(attempts):
+        have = os.path.getsize(tmp) if os.path.exists(tmp) else 0
+        req = urllib.request.Request(url, headers={"Range": f"bytes={have}-"} if have else {})
+        try:
+            with urllib.request.urlopen(req, timeout=60) as r:
+                if have and r.status != 206:  # server ignored the resume request: start over
+                    have = 0
+                total = int(r.headers.get("Content-Length") or 0) + have
+                done, last = have, -1
+                with open(tmp, "ab" if have else "wb") as f:
+                    while True:
+                        chunk = r.read(1 << 20)
+                        if not chunk:
+                            break
+                        f.write(chunk)
+                        done += len(chunk)
+                        if total:
+                            pct = done * 100 // total
+                            if pct != last:
+                                last = pct
+                                size = f" ({done / 1e9:.1f} / {total / 1e9:.1f} GB)" if total > 2e8 else ""
+                                status(f"Downloading {label}... {pct}%{size}")
+            if total and os.path.getsize(tmp) < total:
+                raise IOError("download ended early")
+            os.replace(tmp, dest)
+            return
+        except urllib.error.HTTPError as e:
+            if e.code == 416 and have:  # already have every byte
+                os.replace(tmp, dest)
+                return
+            if attempt == attempts - 1:
+                raise
+        except Exception:
+            if attempt == attempts - 1:
+                raise
+        status(f"Connection dropped - resuming {label}...")
+        time.sleep(2 + attempt * 3)
 
 
 def ensure_sensevoice(status):
@@ -976,13 +999,13 @@ def model_ready(key):
 
 
 def ensure_model(key, status):
-    from huggingface_hub import hf_hub_download
-
     m = LLM_MODELS[key]
+    os.makedirs(MODELS_DIR, exist_ok=True)
     for f in model_files(key):
-        if not os.path.exists(os.path.join(MODELS_DIR, f)):
-            status(f"Downloading {m['label']} ({f}, resumes if interrupted)...")
-            hf_hub_download(m["repo"], f, local_dir=MODELS_DIR)
+        path = os.path.join(MODELS_DIR, f)
+        if not os.path.exists(path):
+            label = m["label"] + (" (image reader)" if f.startswith("mmproj") else "")
+            download(f"https://huggingface.co/{m['repo']}/resolve/main/{f}", path, status, label)
 
 
 def _free_port():
