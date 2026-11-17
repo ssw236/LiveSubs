@@ -1,4 +1,9 @@
+sherpa-onnx>=1.12
 faster-whisper>=1.0.0
 PyAudioWPatch>=0.2.12
+pycaw>=20240210
+comtypes>=1.4
+psutil
+pillow
 numpy
 scipy
