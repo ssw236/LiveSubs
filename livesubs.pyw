@@ -54,7 +54,8 @@ BG = "#101010"
 DEFAULT_AUDIO = "Default speakers"
 
 ENGINES = {
-    "SenseVoice (Chinese / Korean / Japanese - fast)": "sensevoice",
+    "Best accuracy: Qwen3-ASR + SenseVoice (mixed languages, noise)": "qwen3",
+    "Fastest: SenseVoice only": "sensevoice",
     "Whisper large-v3 (all languages)": "whisper-large-v3",
     "Whisper medium (all languages)": "whisper-medium",
     "Whisper small (all languages, light)": "whisper-small",
@@ -77,6 +78,7 @@ LANGUAGES = [
     ("Hebrew", "he"), ("Greek", "el"),
 ]
 LANG_NAME = {code: name for name, code in LANGUAGES if code}
+LANG_NAME["other"] = "Other language"  # Latin-script speech that isn't English, language not set
 SENSEVOICE_LANGS = {"zh", "yue", "ko", "ja", "en"}
 
 # Windows fonts that actually contain each script's characters.
@@ -98,7 +100,8 @@ JUNK = {
 }
 
 DEFAULTS = {
-    "engine": "sensevoice", "device": "auto", "translator": "qwen3-14b",
+    "engine": "qwen3", "device": "auto", "translator": "qwen3-14b",
+    "topic": "", "words": "", "hide_english": False, "asr_v": 2,
     "language": "", "show": "both", "audio_device": "", "app_mode": "all", "apps": [],
     "font": 20, "opacity": 0.75, "width": 0.5, "hold": 7.0,
     "threshold": 0.008, "silence": 0.6, "max_seg": 8.0,
@@ -107,9 +110,21 @@ DEFAULTS = {
     "game_mode": True,
 }
 
+_ASR_REL = "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models"
 SV_NAME = "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17"
-SV_URL = f"https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/{SV_NAME}.tar.bz2"
+SV_URL = f"{_ASR_REL}/{SV_NAME}.tar.bz2"
 SV_DIR = os.path.join(MODELS_DIR, SV_NAME)
+# full-precision SenseVoice: the GPU needs this one (the compact int8 model only runs well on a CPU)
+SVF_NAME = "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17"
+SVF_URL = f"{_ASR_REL}/{SVF_NAME}.tar.bz2"
+SVF_DIR = os.path.join(MODELS_DIR, SVF_NAME)
+# Qwen3-ASR: second, more careful listen of each finished line (mixed languages, background noise)
+Q3_NAME = "sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25"
+Q3_URL = f"{_ASR_REL}/{Q3_NAME}.tar.bz2"
+Q3_DIR = os.path.join(MODELS_DIR, Q3_NAME)
+# Silero VAD: tells speech apart from game sounds / music
+VAD_URL = f"{_ASR_REL}/silero_vad.onnx"
+VAD_PATH = os.path.join(MODELS_DIR, "silero_vad.onnx")
 
 TRANSLATE_PROMPT = (
     "You are a professional subtitle translator for streaming shows, anime, dramas, games and "
@@ -125,6 +140,11 @@ TRANSLATE_PROMPT = (
     "but keep the feeling it adds.\n"
     "- The line comes from automatic speech recognition and may have wrong characters, "
     "homophones or missing words: translate what the speaker most likely MEANT.\n"
+    "- Speakers often mix languages in one sentence (for example Mandarin with English words). "
+    "Keep the English parts as they were said and blend everything into ONE natural English line. "
+    "An English word may have been written as similar-sounding Chinese characters by mistake.\n"
+    "- If you are given two versions of the line from two speech recognizers, they heard the same "
+    "audio and may each be partly wrong: work out what was really said from both, then translate that.\n"
     "- Use the earlier lines only as context (who's talking, what's going on). Keep names as names.\n"
     "- Keep it short and readable like a real subtitle.\n"
     "\nExamples (literal -> how you should translate):\n"
@@ -132,6 +152,9 @@ TRANSLATE_PROMPT = (
     "我真是服了你了。  NOT \"I am really convinced by you.\" -> \"Unbelievable. You're something else.\"\n"
     "绝了！  NOT \"Extinct!\" -> \"That's insane!\"\n"
     "666  -> \"Nice!\"      yyds -> \"GOAT.\"      别装了 -> \"Quit acting.\"\n"
+    "这个 bug 太离谱了，我直接 carry 全场。  -> \"This bug is ridiculous. I straight-up carried the whole game.\"\n"
+    "今天 meeting 取消了，boss 说 next week 再约。  -> \"Today's meeting got cancelled. Boss says we'll reschedule next week.\"\n"
+    "versions \"这个是平凡的 frequently\" / \"就是频繁的 frequent\"  -> \"This one means 'frequently'.\"\n"
     "미쳤다 진짜  NOT \"Went crazy really\" -> \"That's insane, for real.\"\n"
     "아 진짜 짜증나  -> \"Ugh, so annoying.\"      대박 -> \"No way!\"      ㅋㅋㅋ -> \"lol\"\n"
     "マジでヤバいって！  NOT \"Seriously it is dangerous!\" -> \"Dude, this is seriously bad!\"\n"
@@ -191,6 +214,9 @@ def load_settings():
         cfg["engine"] = DEFAULTS["engine"]
     if cfg["translator"] not in TRANSLATORS.values():
         cfg["translator"] = DEFAULTS["translator"]
+    if saved and saved.get("asr_v", 1) < 2 and cfg["engine"] == "sensevoice":
+        cfg["engine"] = "qwen3"  # one-time switch to the more accurate two-pass speech recognition
+    cfg["asr_v"] = 2
     if saved and saved.get("layout_v", 1) < 2:  # older versions saved a much bigger caption box
         cfg.update(font=min(cfg["font"], 20), width=min(cfg["width"], 0.5),
                    history=min(cfg["history"], 2), layout_v=2)
@@ -210,6 +236,85 @@ def save_settings(cfg):
 def is_junk(text):
     t = re.sub(r"[\s。，、！？!?,.…~～\-·]+", "", text.lower())
     return not t or t in {re.sub(r"[\s。，、！？!?,.…~～\-·]+", "", j) for j in JUNK}
+
+
+_PUNCT = re.compile(r"[\s。，、！？!?,.…~～\-·:：;；\"'“”‘’()（）]+")
+ENGLISH_COMMON = set(
+    "the be to of and a in that have i it for not on with he as you do at this but his by from they we say "
+    "her she or an will my one all would there their what so up out if about who get which go me when make "
+    "can like time no just him know take people into year your good some could them see other than then now "
+    "look only come its over think also back after use two how our work first well way even new want because "
+    "any these give day most us is are was were am im dont thats yes yeah ok okay oh hey nice here let lets "
+    "got going right wait why where did does has had been youre theyre cant wont didnt need help someone "
+    "should gonna wanna really very much more guys guy bro dude thanks thank please sorry kill killed push "
+    "enemy team game play shot round".split())
+# short words that are also everyday Spanish/French/German/Italian/Portuguese - not evidence either way
+AMBIGUOUS_WORDS = set("a i no me he in on to do so us an be die son come".split())
+# everyday words of other Latin-script languages that English speech practically never contains
+OTHER_COMMON = set(
+    "que de la el y en es un una por para lo se su le les des du et est je tu il nous vous pas ne der das und "
+    "ist nicht ich sie wir ein eine zu auf che di sono eu uma mas muy pero como esta este esto bien gracias "
+    "hola ser tengo tiene donde cuando porque nada vamos eso oye mira pues vale oui merci avec dans sur mais "
+    "cest jai suis fait veux sais rien allez ce cette qui quoi nein danke bitte sehr auch noch doch schon "
+    "jetzt ciao andiamo bene grazie cosa questo isso tudo obrigado ik het niet een wat dat maar zijn mijn "
+    "saya tidak apa ini itu yang aku kamu sudah hindi ko ang ng mga ako ikaw talaga naman".split())
+
+
+def has_foreign_script(text):
+    """True if the text contains letters that aren't Latin (Chinese, Korean, Japanese, Cyrillic, Arabic...)."""
+    return any(ch.isalpha() and ord(ch) > 0x24F for ch in text)
+
+
+def text_language(text, hint="en"):
+    """Language of a line judged by what was actually written, with the recognizer's guess as a tie-break."""
+    if re.search(r"[\uac00-\ud7af\u1100-\u11ff\u3130-\u318f]", text):
+        return "ko"
+    if re.search(r"[\u3040-\u30ff]", text):
+        return "ja"
+    if re.search(r"[\u3400-\u9fff\uf900-\ufaff]", text):
+        return "yue" if hint == "yue" else "zh"
+    for pattern, code in ((r"[\u0400-\u04ff]", "uk" if hint == "uk" else "ru"), (r"[\u0600-\u06ff]", "ar"),
+                          (r"[\u0e00-\u0e7f]", "th"), (r"[\u0590-\u05ff]", "he"), (r"[\u0370-\u03ff]", "el"),
+                          (r"[\u0900-\u097f]", "hi"), (r"[\u1ea0-\u1ef9]", "vi")):
+        if re.search(pattern, text):
+            return code
+    if has_foreign_script(text):
+        return hint
+    return hint if hint not in ("zh", "yue", "ja", "ko") else "en"
+
+
+def looks_english(text):
+    """Latin-script text counts as English unless there's evidence of another language
+    (so game callouts and names like "Jett dash B main" stay English)."""
+    if re.search(r"[\u00c0-\u024f¿¡]", text):
+        return False  # accented letters: Spanish, French, German, Polish, Turkish, Vietnamese...
+    words = [w.replace("'", "") for w in re.findall(r"[a-z']+", text.lower())]
+    english = sum(w in ENGLISH_COMMON and w not in AMBIGUOUS_WORDS for w in words)
+    other = sum(w in OTHER_COMMON for w in words)
+    return other == 0 or english > other
+
+
+def needs_translation(text, det, trust=False):
+    """Decided from the text itself: a 'mostly English' tag on a mixed line must not skip the Chinese in it.
+    trust=True: det is reliable (Whisper's guess, or a language the user picked), so follow it."""
+    if has_foreign_script(text):
+        return True
+    if trust:
+        return det != "en"
+    words = re.findall(r"[A-Za-zÀ-ɏ']+", text)
+    return len(words) >= 3 and not looks_english(text)
+
+
+def runaway_text(text):
+    """Speech models occasionally get stuck repeating themselves; such output can't be trusted."""
+    t = _PUNCT.sub("", text)
+    return bool(re.search(r"(.{2,12}?)\1{4,}", t))
+
+
+def parse_words(raw):
+    """'Jett, Sage，spike' -> ['Jett', 'Sage', 'spike'] (max 30 short entries)."""
+    items = [w.strip() for w in re.split(r"[,，;；\n]+", raw or "")]
+    return [w for w in items if 0 < len(w) <= 30][:30]
 
 
 def add_nvidia_dll_dirs():
@@ -708,22 +813,52 @@ def download(url, dest, status, label, attempts=5):
         time.sleep(2 + attempt * 3)
 
 
-def ensure_sensevoice(status):
-    model, tokens = os.path.join(SV_DIR, "model.int8.onnx"), os.path.join(SV_DIR, "tokens.txt")
-    if os.path.exists(model) and os.path.exists(tokens):
-        return model, tokens
+def fetch_archive(url, name, wanted, status, label):
+    """Download a model .tar.bz2 into models/ and unpack only the files we need."""
     os.makedirs(MODELS_DIR, exist_ok=True)
-    archive = os.path.join(MODELS_DIR, SV_NAME + ".tar.bz2")
-    download(SV_URL, archive, status, "SenseVoice (first time only)")
-    status("Unpacking SenseVoice...")
+    archive = os.path.join(MODELS_DIR, name + ".tar.bz2")
+    download(url, archive, status, f"{label} (first time only)")
+    status(f"Unpacking {label}...")
     with tarfile.open(archive, "r:bz2") as t:
-        members = [m for m in t.getmembers() if m.name.endswith(("model.int8.onnx", "tokens.txt"))]
+        members = [m for m in t.getmembers() if wanted(m.name)]
         try:
             t.extractall(MODELS_DIR, members=members, filter="data")
         except TypeError:
             t.extractall(MODELS_DIR, members=members)
     os.remove(archive)
+
+
+def ensure_sensevoice(status, full_precision=False):
+    if full_precision:
+        model, tokens = os.path.join(SVF_DIR, "model.onnx"), os.path.join(SVF_DIR, "tokens.txt")
+        if not (os.path.exists(model) and os.path.exists(tokens)):
+            fetch_archive(SVF_URL, SVF_NAME, lambda n: n.endswith(("/model.onnx", "/tokens.txt")),
+                          status, "SenseVoice for the GPU")
+        return model, tokens
+    model, tokens = os.path.join(SV_DIR, "model.int8.onnx"), os.path.join(SV_DIR, "tokens.txt")
+    if not (os.path.exists(model) and os.path.exists(tokens)):
+        fetch_archive(SV_URL, SV_NAME, lambda n: n.endswith(("model.int8.onnx", "tokens.txt")),
+                      status, "SenseVoice")
     return model, tokens
+
+
+def ensure_qwen3asr(status):
+    files = {"conv_frontend": os.path.join(Q3_DIR, "conv_frontend.onnx"),
+             "encoder": os.path.join(Q3_DIR, "encoder.int8.onnx"),
+             "decoder": os.path.join(Q3_DIR, "decoder.int8.onnx"),
+             "tokenizer": os.path.join(Q3_DIR, "tokenizer")}
+    need = list(files.values())[:3] + [os.path.join(Q3_DIR, "tokenizer", "vocab.json")]
+    if not all(os.path.exists(f) for f in need):
+        fetch_archive(Q3_URL, Q3_NAME, lambda n: n.endswith(".onnx") or "/tokenizer" in n,
+                      status, "Qwen3-ASR (0.9 GB)")
+    return files
+
+
+def ensure_vad(status):
+    if not os.path.exists(VAD_PATH):
+        os.makedirs(MODELS_DIR, exist_ok=True)
+        download(VAD_URL, VAD_PATH, status, "voice detector")
+    return VAD_PATH
 
 
 SV_GPU_CACHE = os.path.join(MODELS_DIR, "sensevoice-gpu-check.json")
@@ -750,13 +885,14 @@ def sensevoice_gpu_ok(status=log):
     try:
         with open(SV_GPU_CACHE, encoding="utf-8") as f:
             cached = json.load(f)
-        if cached.get("version") == version:
+        if cached.get("version") == version and cached.get("model") == "full":
             return bool(cached.get("ok"))
     except Exception:
         pass
-    status("Testing the GPU speech engine (first time only)...")
     ok, detail = False, ""
     try:
+        ensure_sensevoice(status, full_precision=True)
+        status("Testing the GPU speech engine (first time only)...")
         r = subprocess.run([_console_python(), os.path.abspath(__file__), "--probe-sv-gpu"],
                            capture_output=True, text=True, timeout=180, cwd=APP_DIR,
                            creationflags=0x08000000 if sys.platform == "win32" else 0)
@@ -773,7 +909,7 @@ def sensevoice_gpu_ok(status=log):
     try:
         os.makedirs(MODELS_DIR, exist_ok=True)
         with open(SV_GPU_CACHE, "w", encoding="utf-8") as f:
-            json.dump({"version": version, "ok": ok}, f)
+            json.dump({"version": version, "model": "full", "ok": ok}, f)
     except Exception:
         pass
     return ok
@@ -783,7 +919,7 @@ def probe_sensevoice_gpu():
     """Child process for sensevoice_gpu_ok(): load on CUDA, decode, report timing."""
     import sherpa_onnx
 
-    model, tokens = ensure_sensevoice(lambda s: None)
+    model, tokens = ensure_sensevoice(lambda s: None, full_precision=True)
     rec = sherpa_onnx.OfflineRecognizer.from_sense_voice(
         model=model, tokens=tokens, num_threads=1, use_itn=True, language="auto", provider="cuda")
     audio = (np.random.default_rng(0).normal(0, 0.05, WHISPER_SR * 5)).astype(np.float32)
@@ -797,15 +933,20 @@ def probe_sensevoice_gpu():
     print(json.dumps({"ok": True, "ms": round(min(times), 1)}), flush=True)
 
 
+NON_SPEECH_EVENTS = {"BGM", "Applause", "Laughter", "Cry", "Sneeze", "Breath", "Cough"}
+
+
 class SenseVoiceASR:
     kind = "sensevoice"
     name = "SenseVoice"
     live_step = 0.4
+    refiner = None  # optional second, more careful recognizer (Qwen3-ASR)
 
     def __init__(self, status, game_mode=True, device="auto"):
         import sherpa_onnx
 
-        model, tokens = ensure_sensevoice(status)
+        self._so = sherpa_onnx
+        self.cpu_model, self.tokens = ensure_sensevoice(status)
         use_gpu = device in ("auto", "cuda") and sensevoice_gpu_ok(status)
         if device == "cuda" and not use_gpu:
             status("GPU speech engine not available - using CPU (run the installer to add it)")
@@ -813,20 +954,133 @@ class SenseVoiceASR:
         self.device = "cuda" if use_gpu else "cpu"
         status(f"Loading SenseVoice on {'GPU' if use_gpu else 'CPU'}...")
         # on the CPU, 2 threads is plenty for real-time speech; more just steals cores from the game
-        threads = 1 if use_gpu else (2 if game_mode else max(2, min(8, (os.cpu_count() or 4) // 2)))
-        self.rec = sherpa_onnx.OfflineRecognizer.from_sense_voice(
-            model=model, tokens=tokens, num_threads=threads, use_itn=True, language="auto",
-            provider="cuda" if use_gpu else "cpu",
-        )
+        self.threads = 2 if game_mode else max(2, min(8, (os.cpu_count() or 4) // 2))
+        if use_gpu:
+            model, _ = ensure_sensevoice(status, full_precision=True)
+            self.rec = self._make(model, "auto", 1, "cuda")
+        else:
+            self.rec = self._make(self.cpu_model, "auto", self.threads, "cpu")
+        self.forced = {}  # language -> recognizer told to expect that language
+        self.lock = threading.Lock()  # a restart can briefly have two listeners using this model
         self.transcribe(np.zeros(WHISPER_SR, np.float32), "", True)  # warm-up
 
-    def transcribe(self, audio16, language, final):
-        s = self.rec.create_stream()
+    def _make(self, model, language, threads, provider):
+        return self._so.OfflineRecognizer.from_sense_voice(
+            model=model, tokens=self.tokens, num_threads=threads, use_itn=True, language=language,
+            provider=provider)
+
+    def _decode(self, rec, audio16):
+        s = rec.create_stream()
         s.accept_waveform(WHISPER_SR, audio16)
-        self.rec.decode_stream(s)
-        lang = (s.result.lang or "").strip("<|>") or "zh"
-        text = s.result.text.strip()
-        return ("" if is_junk(text) else text), lang
+        rec.decode_stream(s)
+        r = s.result
+        lang = (r.lang or "").strip("<|>") or "zh"
+        event = (getattr(r, "event", "") or "").strip("<|>")
+        text = r.text.strip()
+        letters = _PUNCT.sub("", text)
+        if is_junk(text) or (event in NON_SPEECH_EVENTS and len(letters) < 4):
+            text = ""  # music, laughter, a stray syllable...
+        elif len(letters) <= 1 and len(audio16) > WHISPER_SR * 1.5:
+            text = ""  # one character from 1.5+ seconds of sound is noise, not a word
+        return text, lang
+
+    def transcribe(self, audio16, language, final):
+        """language: the 'Spoken language' setting ('' = auto). English is always allowed alongside it,
+        so mixed speech works; any OTHER guess (e.g. Mandarin heard as Cantonese) is re-done as that language."""
+        with self.lock:
+            text, lang = self._decode(self.rec, audio16)
+            if language in SENSEVOICE_LANGS and lang not in (language, "en"):
+                if language not in self.forced:
+                    self.forced = {language: self._make(self.cpu_model, language, self.threads, "cpu")}
+                text, _ = self._decode(self.forced[language], audio16)
+                lang = language
+        return text, lang
+
+
+class Qwen3Refiner:
+    """Second listen with Qwen3-ASR: slower, but trained for mixed Mandarin/English and noisy audio."""
+
+    def __init__(self, status, game_mode=True, words=()):
+        import sherpa_onnx
+
+        f = ensure_qwen3asr(status)
+        status("Loading Qwen3-ASR...")
+        self.words = list(words)
+        self.rec = sherpa_onnx.OfflineRecognizer.from_qwen3_asr(
+            conv_frontend=f["conv_frontend"], encoder=f["encoder"], decoder=f["decoder"],
+            tokenizer=f["tokenizer"], num_threads=2 if game_mode else 4, max_new_tokens=128,
+            hotwords=",".join(w.replace(",", " ") for w in self.words))
+        self.lock = threading.Lock()
+        self.transcribe(np.zeros(WHISPER_SR, np.float32))  # warm-up
+
+    def transcribe(self, audio16):
+        """Returns the text, or '' when there was no real speech or the result can't be trusted."""
+        with self.lock:
+            s = self.rec.create_stream()
+            s.accept_waveform(WHISPER_SR, audio16[:WHISPER_SR * 30])
+            self.rec.decode_stream(s)
+            text = (s.result.text or "").strip()
+        seconds = len(audio16) / WHISPER_SR
+        if text.lower() in ("language", "language none") or is_junk(text) or runaway_text(text):
+            return ""
+        if len(text) > 40 + seconds * 25:  # far more text than anyone can say in that time
+            return ""
+        return text
+
+
+class SpeechGate:
+    """Is someone talking right now? Uses the Silero voice detector, so game sound effects and
+    constant background noise don't count as speech (a loudness check can't tell them apart)."""
+
+    def __init__(self, status=log):
+        import sherpa_onnx
+
+        cfg = sherpa_onnx.VadModelConfig()
+        cfg.silero_vad.model = ensure_vad(status)
+        cfg.silero_vad.threshold = 0.5
+        cfg.silero_vad.min_silence_duration = 0.1
+        cfg.silero_vad.min_speech_duration = 0.1
+        cfg.sample_rate = WHISPER_SR
+        self.model = sherpa_onnx.VadModel.create(cfg)
+        self.win = self.model.window_size()
+        self.lock = threading.Lock()
+        self.reset(WHISPER_SR)
+
+    def reset(self, sr):
+        """sr: sample rate of the audio that will be fed in."""
+        with self.lock:
+            self._reset(sr)
+
+    def _reset(self, sr):
+        self.model.reset()
+        g = gcd(sr, WHISPER_SR)
+        self.up, self.down = WHISPER_SR // g, sr // g
+        # resample in a streaming way: keep a little audio either side so chunk edges don't click
+        self.ctx = self.down * max(1, 441 // self.down) if self.down > 1 else 0
+        self.hist = np.zeros(2 * self.ctx, np.float32)
+        self.tail = np.zeros(0, np.float32)
+
+    def _to16k(self, chunk):
+        if self.down == 1 and self.up == 1:
+            return chunk
+        x = np.concatenate([self.hist, chunk])
+        y = resample_poly(x, self.up, self.down).astype(np.float32)
+        lo = self.ctx * self.up // self.down
+        hi = (len(x) - self.ctx) * self.up // self.down
+        self.hist = x[-2 * self.ctx:]
+        return y[lo:hi]
+
+    def feed(self, chunk):
+        """True if any part of this chunk is speech."""
+        with self.lock:
+            x = np.concatenate([self.tail, self._to16k(chunk)])
+            speech, i = False, 0
+            while i + self.win <= len(x):
+                if self.model.is_speech(x[i:i + self.win]):
+                    speech = True
+                i += self.win
+            self.tail = x[i:]
+        return speech
 
 
 class WhisperASR:
@@ -879,9 +1133,18 @@ class WhisperASR:
         return self._run(audio16, "translate", language, True)[0]
 
 
-def load_asr(engine, device, status, game_mode=True):
-    if engine == "sensevoice":
-        return SenseVoiceASR(status, game_mode, device)
+def load_asr(engine, device, status, game_mode=True, words=()):
+    if engine in ("sensevoice", "qwen3"):
+        asr = SenseVoiceASR(status, game_mode, device)
+        if engine == "qwen3":
+            try:
+                asr.refiner = Qwen3Refiner(status, game_mode, words)
+                asr.name = "Qwen3-ASR + SenseVoice"
+            except Exception as e:
+                log("Qwen3-ASR unavailable, using SenseVoice only:", traceback.format_exc())
+                asr.name = "SenseVoice (Qwen3-ASR failed - see log)"
+                status(f"Qwen3-ASR couldn't load ({str(e)[:80]}) - using SenseVoice only")
+        return asr
     return WhisperASR(engine.split("-", 1)[1], device, status)
 
 
@@ -1283,13 +1546,24 @@ class Translator(threading.Thread):
             log(traceback.format_exc())
             return self.error
 
-    def _messages(self, text, lang, context, fix):
+    def _messages(self, text, lang, context, fix, alt=None):
+        system = TRANSLATE_PROMPT
+        topic = (self.cfg.get("topic") or "").strip()
+        words = parse_words(self.cfg.get("words"))
+        if topic:
+            system += f"\nWhat the viewer is watching (use it to make sense of unclear words): {topic[:300]}\n"
+        if words:
+            system += ("Names and terms that come up here (if a word sounds like one of these, it probably is; "
+                       f"keep them as written): {', '.join(words)}\n")
         ctx = "\n".join(context) if context else "(none)"
-        user = f"Earlier lines:\n{ctx}\n\nNew line ({LANG_NAME.get(lang, lang)}):\n{text}"
-        return [{"role": "system", "content": TRANSLATE_PROMPT + (FORMAT_FIX if fix else FORMAT_ENGLISH)},
+        mixed = " mixed with English" if lang != "en" and re.search(r"[A-Za-z]{2,}", text) else ""
+        user = f"Earlier lines:\n{ctx}\n\nNew line ({LANG_NAME.get(lang, lang)}{mixed}):\n{text}"
+        if alt:
+            user += f"\n\nA second speech recognizer heard the same line as:\n{alt}"
+        return [{"role": "system", "content": system + (FORMAT_FIX if fix else FORMAT_ENGLISH)},
                 {"role": "user", "content": user + "\n/no_think"}]
 
-    def translate_text(self, text, lang, context, on_english=None, fix=None):
+    def translate_text(self, text, lang, context, on_english=None, fix=None, alt=None):
         """Returns (fixed_original, english). on_english(text) gets the English as it streams in."""
         fix = (lang in FIX_LANGS) if fix is None else fix
         last = [""]
@@ -1300,17 +1574,18 @@ class Translator(threading.Thread):
                 last[0] = eng
                 on_english(eng)
 
-        reply = HOST.chat(self.cfg["translator"], self._messages(text, lang, context, fix),
+        reply = HOST.chat(self.cfg["translator"], self._messages(text, lang, context, fix, alt),
                           max_tokens=250 if fix else 120, temperature=0.3, timeout=60,
                           on_text=stream if on_english else None)
         return parse_translation(reply, text)
 
-    def submit(self, line_id, text, lang):
+    def submit(self, line_id, text, lang, alt=None, fix=None):
+        """alt: how a second recognizer heard the line. fix: also ask for a corrected original."""
         self.finished.append(line_id)
         with self.plock:
             if self.preview_slot and self.preview_slot[0] == line_id:
                 self.preview_slot = None
-        self.inbox.put((line_id, text, lang))
+        self.inbox.put((line_id, text, lang, alt, fix))
 
     def preview(self, utt_id, text, lang):
         """Offer a still-being-spoken line for a quick early translation."""
@@ -1342,7 +1617,7 @@ class Translator(threading.Thread):
     def run(self):
         while True:
             try:
-                line_id, text, lang = self.inbox.get(timeout=0.05)
+                line_id, text, lang, alt, fix = self.inbox.get(timeout=0.05)
             except queue.Empty:
                 self._do_preview()
                 continue
@@ -1354,7 +1629,7 @@ class Translator(threading.Thread):
                     continue
                 t0 = time.monotonic()
                 fixed, eng = self.translate_text(
-                    text, lang, list(self.history),
+                    text, lang, list(self.history), fix=fix, alt=alt,
                     on_english=lambda e: self.out.put(("translating", line_id, e)))
                 log(f"  -> {fixed} | {eng}  ({(time.monotonic() - t0) * 1000:.0f} ms)")
                 if eng:
@@ -1369,11 +1644,16 @@ class Translator(threading.Thread):
 # Listening loop
 # --------------------------------------------------------------------------
 class Listener(threading.Thread):
-    def __init__(self, asr, translator, cfg, out_q, speakers=None):
+    MAX_SEG = 10.0     # seconds: a line longer than this is split at its most recent pause
+    MIN_SPEECH = 0.25  # seconds of detected voice a line needs to count at all
+
+    def __init__(self, asr, translator, cfg, out_q, speakers=None, gate=None):
         super().__init__(daemon=True)
         self.asr, self.translator, self.cfg, self.out = asr, translator, cfg, out_q
         self.speakers = speakers
+        self.gate = gate    # voice detector (None = fall back to a loudness check)
         self.utt_id = None  # id of the line being spoken right now
+        self.refine_q = queue.Queue()
         self.stop_evt = threading.Event()
 
     def stop(self):
@@ -1385,6 +1665,8 @@ class Listener(threading.Thread):
             cap = open_capture(self.cfg, on_error=lambda e: self.out.put(("error", e)))
             log(f"Listening to: {cap.name} @ {cap.sr} Hz")
             self.out.put(("listening", cap.name))
+            if getattr(self.asr, "refiner", None):
+                threading.Thread(target=self._refine_loop, daemon=True).start()
             self.loop(cap.q, cap.sr)
         except Exception as e:
             log(traceback.format_exc())
@@ -1394,38 +1676,150 @@ class Listener(threading.Thread):
                 cap.close()
             self.out.put(("stopped", self))
 
+    # ---- language setting ----
     def language(self):
         lang = self.cfg.get("language") or ""
         if self.asr.kind == "sensevoice" and lang not in SENSEVOICE_LANGS:
             return ""
         return lang
 
+    def fast_pass_ok(self):
+        """SenseVoice only knows 5 languages; for others (Spanish, French...) only Qwen3-ASR is used."""
+        lang = self.cfg.get("language") or ""
+        return self.asr.kind != "sensevoice" or not lang or lang in SENSEVOICE_LANGS
+
+    # ---- finished lines ----
     def finish_line(self, audio16):
-        lang = self.language()
-        orig, det = self.asr.transcribe(audio16, lang, True)
         line_id, self.utt_id = self.utt_id or next(_line_ids), None
-        if not orig:
+        refiner = getattr(self.asr, "refiner", None)
+        if self.fast_pass_ok():
+            text, det = self.asr.transcribe(audio16, self.language(), True)
+        else:
+            text, det = "", self.cfg.get("language") or "en"
+        if not text and not refiner:
             self.out.put(("dropped", line_id))
             return
-        can_translate = bool(self.translator.ready_model) or self.asr.kind == "whisper"
-        needs_english = det != "en" and self.cfg["show"] != "original" and can_translate
         spk = self.speakers.identify(audio16) if self.speakers and self.cfg.get("speakers", True) else None
-        self.out.put(("final", line_id, orig, det, needs_english, spk))
-        log(f"[{det}] (speaker {spk}) {orig}")
+        if not refiner:
+            self._publish("final", line_id, text, det, spk, audio16)
+            return
+        # Two-pass: show the quick version now if it looks like real speech, then let Qwen3-ASR
+        # re-listen in the background and correct (or remove) it.
+        lang, need = self._classify(text, det)
+        shown = len(_PUNCT.sub("", text)) >= 3 and not (self.cfg.get("hide_english") and not need)
+        if shown:
+            self.out.put(("final", line_id, text, lang, self._wants_english(need), spk, True))
+        self.refine_q.put((line_id, audio16, text, det, spk, shown))
+
+    def _trusted_language(self):
+        """A language the user picked that SenseVoice can't recognise itself (Spanish, French...)."""
+        lang = self.cfg.get("language") or ""
+        return lang if lang and lang not in SENSEVOICE_LANGS else None
+
+    def _classify(self, text, det):
+        """(language label, does it need translating?) - judged from what was actually said."""
+        if self.asr.kind == "whisper":
+            return det, needs_translation(text, det, trust=True)
+        trusted = self._trusted_language()
+        lang = text_language(text, trusted or det)
+        if lang == "en" and needs_translation(text, "en"):
+            lang = "other"  # Latin letters but not English (Spanish, French...) with no language picked
+        return lang, needs_translation(text, lang, trust=bool(trusted))
+
+    def _wants_english(self, need):
+        can_translate = bool(self.translator.ready_model) or self.asr.kind == "whisper"
+        return need and self.cfg["show"] != "original" and can_translate
+
+    def _refine_loop(self):
+        while not self.stop_evt.is_set():
+            try:
+                line_id, audio16, quick, det, spk, shown = self.refine_q.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            try:
+                if self.refine_q.qsize() >= 2 and quick:
+                    text = quick  # falling behind: skip the slow second listen for this line
+                else:
+                    t0 = time.monotonic()
+                    text = self.asr.refiner.transcribe(audio16)
+                    log(f"  second listen ({(time.monotonic() - t0) * 1000:.0f} ms): {text!r}  (quick: {quick!r})")
+            except Exception:
+                log(traceback.format_exc())
+                text = quick
+            if not text:  # Qwen3-ASR heard no real speech: it was noise/music
+                self.out.put(("retract" if shown else "dropped", line_id))
+                continue
+            self._publish("refined", line_id, text, det, spk, audio16, alt=quick)
+
+    def _publish(self, kind, line_id, text, det, spk, audio16, alt=None):
+        whisper = self.asr.kind == "whisper"
+        lang, need = self._classify(text, det)
+        if self.cfg.get("hide_english") and not need:
+            self.out.put(("retract", line_id))
+            return
+        needs_english = self._wants_english(need)
+        self.out.put((kind, line_id, text, lang, needs_english, spk, False))
+        log(f"[{lang}] (speaker {spk}) {text}")
         if not needs_english:
             return
         if self.translator.ready_model:
-            self.translator.submit(line_id, orig, det)
-        elif self.asr.kind == "whisper":  # no AI translator: fall back to Whisper's own
+            differs = alt and _PUNCT.sub("", alt).lower() != _PUNCT.sub("", text).lower()
+            self.translator.submit(line_id, text, lang, alt=alt if differs else None,
+                                   fix=lang in FIX_LANGS and kind != "refined")
+        elif whisper:  # no AI translator: fall back to Whisper's own
             eng = self.asr.translate(audio16, det)
             if eng:
-                self.out.put(("translated", line_id, eng, orig))
+                self.out.put(("translated", line_id, eng, text))
+
+    # ---- audio loop ----
+    @staticmethod
+    def _cut_index(chunks, sr):
+        """Where to split a line that has run too long while the person is still talking:
+        the most recent pause, or failing that the quietest moment of the last few seconds."""
+        n = len(chunks)
+        for i in range(n - 1, int(n * 0.4), -1):
+            if not chunks[i][1]:
+                return i + 1
+        tail = max(1, int(3.0 * sr / max(1, len(chunks[-1][0]))))
+        lo = max(1, n - tail)
+        energies = [float(np.mean(ch * ch)) for ch, _ in chunks[lo:]]
+        return lo + int(np.argmin(energies)) + 1
 
     def loop(self, q, sr):
         g = gcd(sr, WHISPER_SR)
         up, down = WHISPER_SR // g, sr // g
+        gate = self.gate
+        if gate:
+            gate.reset(sr)
         preroll = int(sr * 0.3)
-        buf, voiced, last_voice, last_run = [], False, 0.0, 0.0
+        st = {"chunks": [], "voiced": False, "quiet": 0, "end_quiet": 0}  # chunks: [(samples, is_speech)]
+        last_run = 0.0
+
+        def to16k(parts):
+            return resample_poly(np.concatenate(parts), up, down).astype(np.float32)
+
+        def end_line(ended):
+            chunks = st["chunks"]
+            if ended:
+                seg, rest = chunks, []
+            else:
+                k = self._cut_index(chunks, sr)
+                seg, rest = chunks[:k], chunks[k:]
+            voice = sum(len(ch) for ch, sp in seg if sp) / sr
+            st["chunks"] = rest
+            st["voiced"] = any(sp for _, sp in rest)
+            st["quiet"] = 0
+            if voice < self.MIN_SPEECH:  # a click or blip, not a line
+                if self.utt_id is not None:
+                    self.out.put(("dropped", self.utt_id))
+                    self.utt_id = None
+                return
+            parts = [ch for ch, _ in seg]
+            if ended:  # drop most of the trailing silence, keep a short tail
+                extra = st["end_quiet"] - int(0.25 * sr)
+                while extra > 0 and len(parts) > 1 and len(parts[-1]) <= extra:
+                    extra -= len(parts.pop())
+            self.finish_line(to16k(parts))
 
         while not self.stop_evt.is_set():
             c = self.cfg
@@ -1433,48 +1827,57 @@ class Listener(threading.Thread):
                 chunk = q.get(timeout=0.1)
             except queue.Empty:
                 chunk = None
-            now = time.monotonic()
             while chunk is not None:
-                buf.append(chunk)
-                if np.sqrt(np.mean(chunk * chunk)) > c["threshold"]:
-                    voiced, last_voice = True, now
+                if gate:
+                    try:
+                        speech = gate.feed(chunk)
+                    except Exception:
+                        log(traceback.format_exc())
+                        gate = None  # voice detector broke: use the loudness check from here on
+                        speech = False
+                if not gate:
+                    speech = float(np.sqrt(np.mean(chunk * chunk))) > c["threshold"]
+                st["chunks"].append((chunk, speech))
+                if speech:
+                    st["voiced"], st["quiet"] = True, 0
+                elif st["voiced"]:
+                    st["quiet"] += len(chunk)
+                    if st["quiet"] / sr >= c["silence"]:  # they stopped talking: the line is finished
+                        st["end_quiet"] = st["quiet"]
+                        end_line(True)
                 try:
                     chunk = q.get_nowait()
                 except queue.Empty:
                     chunk = None
 
-            n = sum(len(b) for b in buf)
-            if not voiced:
-                if n > preroll:
-                    buf = [np.concatenate(buf)[-preroll:]]
+            chunks = st["chunks"]
+            n = sum(len(ch) for ch, _ in chunks)
+            if not st["voiced"]:
+                while len(chunks) > 1 and n - len(chunks[0][0]) >= preroll:  # keep a short lead-in only
+                    n -= len(chunks.pop(0)[0])
                 continue
 
-            final = (now - last_voice) >= c["silence"] or n / sr >= c["max_seg"]
+            if n / sr >= max(c["max_seg"], self.MAX_SEG):
+                end_line(False)
+                continue
+
+            now = time.monotonic()
             step = self.asr.live_step * (1.5 if c.get("game_mode", True) else 1.0)
-            if not final and now - last_run < step:
+            if now - last_run < step or not self.fast_pass_ok():
                 continue
             last_run = now
-
-            audio = np.concatenate(buf)
-            buf = [audio]
-            audio16 = resample_poly(audio, up, down).astype(np.float32)
-
-            if final:
-                buf, voiced = [], False
-                self.finish_line(audio16)
-            else:
-                text, det = self.asr.transcribe(audio16, self.language(), False)
-                if text:
-                    if self.utt_id is None:
-                        self.utt_id = next(_line_ids)
-                    self.out.put(("partial", text, det, self.utt_id))
-                    if det != "en" and self.cfg["show"] != "original" and not self.cfg.get("game_mode", True):
-                        self.translator.preview(self.utt_id, text, det)
+            text, det = self.asr.transcribe(to16k([ch for ch, _ in chunks]), self.language(), False)
+            if text:
+                lang, need = self._classify(text, det)
+                if self.cfg.get("hide_english") and not need:
+                    continue  # don't flash up English that's going to be hidden anyway
+                if self.utt_id is None:
+                    self.utt_id = next(_line_ids)
+                self.out.put(("partial", text, lang, self.utt_id))
+                if not self.cfg.get("game_mode", True) and self.cfg["show"] != "original" and need:
+                    self.translator.preview(self.utt_id, text, lang)
 
 
-# --------------------------------------------------------------------------
-# Subtitle overlay
-# --------------------------------------------------------------------------
 # --------------------------------------------------------------------------
 # Game-safe windows: never take focus, so fullscreen games don't minimise / tab out
 # --------------------------------------------------------------------------
@@ -1777,9 +2180,28 @@ class Overlay:
             self.spk_seen.add(spk)
         self.lines.append({"id": line_id, "orig": orig, "lang": lang, "eng": early if needs_english else None,
                            "done": False, "needs": needs_english, "spk": spk})
+        self.lines.sort(key=lambda ln: ln["id"])  # a line confirmed late still goes in its spoken place
         del self.lines[:-8]
         self._redraw()
         self._activity()
+
+    def refined(self, line_id, orig, lang, needs_english, spk=None):
+        """The second, more careful listen came back: correct the line (or add it if it wasn't shown yet)."""
+        ln = self._find(line_id)
+        if not ln:
+            return self.final(line_id, orig, lang, needs_english, spk)
+        ln.update(orig=orig, lang=lang, needs=needs_english)
+        if not needs_english:
+            ln["eng"] = None
+        self._redraw()
+        self._activity()
+
+    def retract(self, line_id):
+        """It turned out not to be speech (or the line is hidden): take it off the screen."""
+        if self.live and self.live.get("id") == line_id:
+            self.live = None
+        self.lines = [ln for ln in self.lines if ln["id"] != line_id]
+        self._redraw()
 
     def dropped(self, line_id):
         if self.live and self.live.get("id") == line_id:
@@ -2367,6 +2789,7 @@ class App:
         self.q = queue.Queue()
         self.asr = None
         self.speakers = None
+        self.gate = None
         self.listener = None
         self.loading = self.reload_pending = False
         self.want_listen = bool(self.cfg["autostart"])
@@ -2444,24 +2867,37 @@ class App:
         self.tr_cb.grid(row=4, column=1, sticky="ew")
         self.tr_cb.bind("<<ComboboxSelected>>", lambda e: self.translator_changed())
 
+        # Help for the recognizer and translator
+        row(5, "Topic")
+        self.topic_var = tk.StringVar(value=c["topic"])
+        te = ttk.Entry(f, textvariable=self.topic_var)
+        te.grid(row=5, column=1, sticky="ew")
+        row(6, "Custom words")
+        self.words_var = tk.StringVar(value=c["words"])
+        we = ttk.Entry(f, textvariable=self.words_var)
+        we.grid(row=6, column=1, sticky="ew")
+        for ent in (te, we):
+            ent.bind("<FocusOut>", lambda e: self.hints_changed())
+            ent.bind("<Return>", lambda e: self.hints_changed())
+
         # Language
-        row(5, "Spoken language")
+        row(7, "Spoken language")
         self.lang_cb = ttk.Combobox(f, values=[n for n, _ in LANGUAGES], state="readonly")
         self.lang_cb.set(next((n for n, code in LANGUAGES if code == c["language"]), "Auto-detect"))
-        self.lang_cb.grid(row=5, column=1, sticky="ew")
+        self.lang_cb.grid(row=7, column=1, sticky="ew")
         self.lang_cb.bind("<<ComboboxSelected>>", lambda e: self.simple_changed())
 
         # Show mode
-        row(6, "Show")
+        row(8, "Show")
         self.show_cb = ttk.Combobox(f, values=list(SHOW_MODES), state="readonly")
         self.show_cb.set({v: k for k, v in SHOW_MODES.items()}.get(c["show"], "Original + English"))
-        self.show_cb.grid(row=6, column=1, sticky="ew")
+        self.show_cb.grid(row=8, column=1, sticky="ew")
         self.show_cb.bind("<<ComboboxSelected>>", lambda e: self.simple_changed())
 
         # Which apps to listen to
-        row(7, "Listen to")
+        row(9, "Listen to")
         lf = ttk.Frame(f)
-        lf.grid(row=7, column=1, sticky="ew")
+        lf.grid(row=9, column=1, sticky="ew")
         lf.columnconfigure(0, weight=1)
         self.appmode_cb = ttk.Combobox(lf, values=list(APP_MODES), state="readonly")
         self.appmode_cb.set({v: k for k, v in APP_MODES.items()}.get(c["app_mode"], "All apps"))
@@ -2470,12 +2906,12 @@ class App:
         self.apps_btn = ttk.Button(lf, text="Apps...", command=self.pick_apps)
         self.apps_btn.grid(row=0, column=1, padx=(6, 0))
         self.apps_var = tk.StringVar()
-        ttk.Label(f, textvariable=self.apps_var, foreground="#777").grid(row=8, column=1, sticky="w")
+        ttk.Label(f, textvariable=self.apps_var, foreground="#777").grid(row=10, column=1, sticky="w")
 
         # Output device (for "All apps")
-        row(9, "Output device")
+        row(11, "Output device")
         af = ttk.Frame(f)
-        af.grid(row=9, column=1, sticky="ew")
+        af.grid(row=11, column=1, sticky="ew")
         af.columnconfigure(0, weight=1)
         self.audio_cb = ttk.Combobox(af, state="readonly")
         self.audio_cb.grid(row=0, column=0, sticky="ew")
@@ -2483,7 +2919,7 @@ class App:
         ttk.Button(af, text="↻", width=3, command=self.refresh_audio).grid(row=0, column=1, padx=(6, 0))
         self.refresh_audio()
 
-        ttk.Separator(f).grid(row=10, column=0, columnspan=2, sticky="ew", pady=10)
+        ttk.Separator(f).grid(row=12, column=0, columnspan=2, sticky="ew", pady=10)
 
         def slider(i, label, key, lo, hi, cast):
             row(i, label)
@@ -2492,31 +2928,35 @@ class App:
                       command=lambda v: self.look_changed(key, cast(float(v)))).grid(row=i, column=1, sticky="ew")
             return var
 
-        self.font_var = slider(11, "Text size", "font", 10, 48, int)
-        slider(12, "Background", "opacity", 0.3, 1.0, float)
-        slider(13, "Max width", "width", 0.25, 1.0, float)
-        slider(14, "Lines on screen", "history", 1, 4, lambda v: int(round(v)))
+        self.font_var = slider(13, "Text size", "font", 10, 48, int)
+        slider(14, "Background", "opacity", 0.3, 1.0, float)
+        slider(15, "Max width", "width", 0.25, 1.0, float)
+        slider(16, "Lines on screen", "history", 1, 4, lambda v: int(round(v)))
 
         self.spk_var = tk.BooleanVar(value=c["speakers"])
         ttk.Checkbutton(f, text="Label different speakers", variable=self.spk_var,
                         command=lambda: self.look_changed("speakers", self.spk_var.get())
-                        ).grid(row=15, column=0, columnspan=2, sticky="w", pady=(8, 0))
+                        ).grid(row=17, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        self.hide_en_var = tk.BooleanVar(value=c["hide_english"])
+        ttk.Checkbutton(f, text="Hide lines that are already in English", variable=self.hide_en_var,
+                        command=lambda: self.look_changed("hide_english", self.hide_en_var.get())
+                        ).grid(row=18, column=0, columnspan=2, sticky="w")
 
         self.click_var = tk.BooleanVar(value=c["click_through"])
         ttk.Checkbutton(f, text=f"Lock captions in place   ({HOTKEY_LOCK_LABEL})", variable=self.click_var,
                         command=lambda: self.set_locked(self.click_var.get())
-                        ).grid(row=16, column=0, columnspan=2, sticky="w")
+                        ).grid(row=19, column=0, columnspan=2, sticky="w")
         self.overlay.on_lock = self.set_locked
         self.game_var = tk.BooleanVar(value=c["game_mode"])
         ttk.Checkbutton(f, text="Game mode (smoother games - English shows when each line ends)",
                         variable=self.game_var, command=self.game_mode_changed
-                        ).grid(row=17, column=0, columnspan=2, sticky="w")
+                        ).grid(row=20, column=0, columnspan=2, sticky="w")
         self.auto_var = tk.BooleanVar(value=c["autostart"])
         ttk.Checkbutton(f, text="Start subtitles when the app opens", variable=self.auto_var,
-                        command=self.simple_changed).grid(row=18, column=0, columnspan=2, sticky="w")
+                        command=self.simple_changed).grid(row=21, column=0, columnspan=2, sticky="w")
 
         bf = ttk.Frame(f)
-        bf.grid(row=19, column=0, columnspan=2, sticky="ew", pady=(14, 0))
+        bf.grid(row=22, column=0, columnspan=2, sticky="ew", pady=(14, 0))
         bf.columnconfigure((0, 1, 2), weight=1)
         self.start_btn = ttk.Button(bf, text="Start subtitles", command=self.toggle_listen)
         self.start_btn.grid(row=0, column=0, sticky="ew")
@@ -2532,7 +2972,7 @@ class App:
                   foreground="#888").grid(row=3, column=0, columnspan=3, pady=(4, 0))
 
         ttk.Label(f, text="Drag the box to move it · scroll on it to resize text · right-click for options",
-                  foreground="#888").grid(row=20, column=0, columnspan=2, pady=(10, 0))
+                  foreground="#888").grid(row=23, column=0, columnspan=2, pady=(10, 0))
         self._sync_device_box()
         self._sync_app_widgets()
 
@@ -2736,7 +3176,7 @@ class App:
         self.overlay.apply()
         lang = self.cfg["language"]
         if self.cfg["engine"] == "sensevoice" and lang and lang not in SENSEVOICE_LANGS:
-            self.set_status(f"SenseVoice can't do {LANG_NAME[lang]} - pick a Whisper model", "#d9534f")
+            self.set_status(f"SenseVoice can't do {LANG_NAME[lang]} - pick Best accuracy or Whisper", "#d9534f")
 
     def look_changed(self, key, value):
         self.cfg[key] = value
@@ -2748,6 +3188,16 @@ class App:
         self.cfg["audio_device"] = "" if sel == DEFAULT_AUDIO else sel
         save_settings(self.cfg)
         self.restart_listening()
+
+    def hints_changed(self):
+        topic, words = self.topic_var.get().strip(), self.words_var.get().strip()
+        if topic == self.cfg["topic"] and words == self.cfg["words"]:
+            return
+        reload_asr = parse_words(words) != parse_words(self.cfg["words"]) and self.cfg["engine"] == "qwen3"
+        self.cfg["topic"], self.cfg["words"] = topic, words
+        save_settings(self.cfg)
+        if reload_asr:
+            self.load_asr()  # Qwen3-ASR takes its word list when it loads
 
     def engine_changed(self):
         self.cfg["engine"] = ENGINES[self.engine_cb.get()]
@@ -2777,8 +3227,14 @@ class App:
 
         def work():
             try:
-                asr = load_asr(engine, dev, status=lambda s: self.q.put(("status", s)),
-                               game_mode=self.cfg.get("game_mode", True))
+                say = lambda s: self.q.put(("status", s))  # noqa: E731
+                asr = load_asr(engine, dev, status=say, game_mode=self.cfg.get("game_mode", True),
+                               words=parse_words(self.cfg.get("words")))
+                if not self.gate:
+                    try:
+                        self.gate = SpeechGate(say)
+                    except Exception as e:
+                        log("Voice detector unavailable, using loudness instead:", e)
                 if not self.speakers:
                     try:
                         self.speakers = SpeakerTracker(status=lambda s: self.q.put(("status", s)))
@@ -2816,7 +3272,7 @@ class App:
             return
         if self.speakers:
             self.speakers.reset()
-        self.listener = Listener(self.asr, self.translator, self.cfg, self.q, self.speakers)
+        self.listener = Listener(self.asr, self.translator, self.cfg, self.q, self.speakers, self.gate)
         self.listener.start()
         self.start_btn.config(text="Stop subtitles")
 
@@ -2911,11 +3367,17 @@ class App:
                 elif kind == "partial":
                     self.overlay.partial(msg[1], msg[2], msg[3])
                     self.hear_var.set(f"Hearing: {LANG_NAME.get(msg[2], msg[2])}")
-                elif kind == "final":
-                    self.overlay.final(*msg[1:])
-                    _lid, _orig, _lang, _needs, _spk = msg[1:6]
-                    self.history.line(_lid, _orig, _lang, _needs, _spk)
-                    self.hear_var.set(f"Hearing: {LANG_NAME.get(msg[3], msg[3])}")
+                elif kind in ("final", "refined"):
+                    _lid, _orig, _lang, _needs, _spk, _pending = msg[1:7]
+                    if kind == "final":
+                        self.overlay.final(_lid, _orig, _lang, _needs, _spk)
+                    else:
+                        self.overlay.refined(_lid, _orig, _lang, _needs, _spk)
+                    if not _pending:  # log once the text is settled (after the second listen, if any)
+                        self.history.line(_lid, _orig, _lang, _needs, _spk)
+                    self.hear_var.set(f"Hearing: {LANG_NAME.get(_lang, _lang)}")
+                elif kind == "retract":
+                    self.overlay.retract(msg[1])
                 elif kind == "translated":
                     self.overlay.translated(msg[1], msg[2], msg[3])
                     self.history.translated(msg[1], msg[2], msg[3])
@@ -2984,8 +3446,10 @@ def prepare():
     def say(s):
         print("       " + s, flush=True)
 
-    asr = load_asr(cfg["engine"], cfg["device"], say)
+    asr = load_asr(cfg["engine"], cfg["device"], say, cfg.get("game_mode", True), parse_words(cfg.get("words")))
     say(f"Speech model ready: {asr.name} ({'GPU' if asr.device == 'cuda' else 'CPU'})")
+    SpeechGate(say)
+    say("Voice detector ready.")
     SpeakerTracker(say)
     say("Speaker model ready.")
 

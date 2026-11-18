@@ -1,4 +1,4 @@
-sherpa-onnx>=1.12
+sherpa-onnx>=2.0.1
 faster-whisper>=1.0.0
 PyAudioWPatch>=0.2.12
 pycaw>=20240210
