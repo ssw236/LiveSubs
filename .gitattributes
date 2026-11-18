@@ -1,0 +1,7 @@
+# Windows batch files are stored byte-for-byte with CRLF endings (LF can break labels/goto)
+*.bat -text
+*.pyw text eol=lf
+*.py  text eol=lf
+*.md  text eol=lf
+*.txt text eol=lf
+*.ico binary

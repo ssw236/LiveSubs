@@ -1,0 +1,17 @@
+# Downloaded AI models and engine (~18 GB) - the installer fetches these
+models/
+
+# Personal data: settings and translated chat logs
+settings.json
+settings.json.tmp
+history/
+
+# Logs
+*.log
+
+# Python
+__pycache__/
+*.pyc
+
+# Partial downloads
+*.part
