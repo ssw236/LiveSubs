@@ -98,3 +98,7 @@ Screenshot translation uses Qwen3-VL 8B. Speaker colours use a 3D-Speaker voice-
   [pycaw](https://github.com/AndreMiras/pycaw)
 
 The AI models are downloaded from their publishers and each one has its own license.
+
+## License
+
+MIT - see [LICENSE](LICENSE).
