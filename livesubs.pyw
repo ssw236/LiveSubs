@@ -3044,7 +3044,7 @@ class App:
                         ).grid(row=19, column=0, columnspan=2, sticky="w")
         self.overlay.on_lock = self.set_locked
         self.game_var = tk.BooleanVar(value=c["game_mode"])
-        ttk.Checkbutton(f, text="Game mode (smoother games - English shows when each line ends)",
+        ttk.Checkbutton(f, text="Game mode (smoother games - captions appear when each line ends)",
                         variable=self.game_var, command=self.game_mode_changed
                         ).grid(row=20, column=0, columnspan=2, sticky="w")
         self.auto_var = tk.BooleanVar(value=c["autostart"])
