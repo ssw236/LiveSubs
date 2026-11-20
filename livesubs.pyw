@@ -170,13 +170,16 @@ FORMAT_FIX = (
 )
 FIX_LANGS = {"ko"}  # SenseVoice's Korean word spacing needs repairing; other languages don't
 
-SCREEN_PROMPT = (
-    "Read all the text in this screenshot (it may be game UI, a menu, chat, manga, a sign, "
-    "a video frame...). Then translate it into natural, fluent English that conveys the meaning.\n"
-    "Reply in exactly this format and nothing else:\n"
-    "ORIGINAL:\n<the text exactly as written, keeping line breaks>\n"
-    "ENGLISH:\n<the natural English translation, matching line breaks>\n"
-    "If there is no readable text, reply: ORIGINAL:\n(none)\nENGLISH:\n(no text found)"
+# Qwen3-VL's own text-spotting prompt (from Qwen's OCR cookbook); boxes come back on a 0-999 scale
+SPOT_PROMPT = ("Spotting all the text in the image with line-level, and output in JSON format as "
+               "[{'bbox_2d': [x1, y1, x2, y2], 'text_content': 'text'}, ...].")
+SCREEN_TRANSLATE_PROMPT = (
+    "You translate text read from a screenshot (game UI, menus, chat, subtitles, signs, manga) into natural "
+    "English. Each numbered item is one line or label, possibly misread by OCR: translate what it most likely "
+    "says. Keep buttons and labels short, keep names as names, and keep slang and tone (casual stays casual, "
+    "rude stays rude). If an item is already English, repeat it unchanged.\n"
+    "Reply with exactly one line per item, numbered the same way:\n1. <English>\n2. <English>\n"
+    "No notes, no quotes, no extra lines."
 )
 VISION_MODEL = "qwen3-vl-8b"
 
@@ -1540,12 +1543,69 @@ def english_so_far(text):
     return _unquote(text.strip().split("\n\n")[0]) if text.strip() else ""
 
 
-def parse_screen(text):
-    text = re.sub(r"<think>.*?</think>", "", text, flags=re.S).strip()
-    m = re.search(r"ORIGINAL:\s*(.*?)\s*ENGLISH:\s*(.*)", text, flags=re.S | re.I)
-    if not m:
-        return "", text
-    return m.group(1).strip(), m.group(2).strip()
+def parse_spots(reply):
+    """[{'box': [x1, y1, x2, y2] as the model wrote them, 'text': str}] from Qwen3-VL's text-spotting reply.
+    Copes with code fences, single quotes and replies cut off part-way."""
+    import ast
+
+    text = re.sub(r"<think>.*?</think>", "", reply or "", flags=re.S)
+    text = re.sub(r"```(?:json)?", "", text)
+    data = None
+    m = re.search(r"\[.*\]", text, flags=re.S)
+    if m:
+        for loader in (json.loads, ast.literal_eval):
+            try:
+                data = loader(m.group(0))
+                break
+            except Exception:
+                pass
+    if not isinstance(data, list):  # damaged or cut-off list: keep every complete entry
+        data = []
+        for obj in re.finditer(r"\{[^{}]*\}", text):
+            for loader in (json.loads, ast.literal_eval):
+                try:
+                    data.append(loader(obj.group(0)))
+                    break
+                except Exception:
+                    pass
+    out = []
+    for d in data:
+        if not isinstance(d, dict):
+            continue
+        box = d.get("bbox_2d") or d.get("bbox")
+        t = " ".join(str(d.get("text_content") or d.get("text") or "").split())
+        if not t or not isinstance(box, (list, tuple)) or len(box) != 4:
+            continue
+        try:
+            x1, y1, x2, y2 = (float(v) for v in box)
+        except (TypeError, ValueError):
+            continue
+        x1, x2 = sorted((x1, x2))
+        y1, y2 = sorted((y1, y2))
+        if x2 > x1 and y2 > y1 and x1 >= 0 and y1 >= 0:
+            out.append({"box": (x1, y1, x2, y2), "text": t})
+    return out
+
+
+def parse_numbered(reply, n):
+    """'1. ...\n2. ...' -> list of n strings ('' where an item is missing)."""
+    text = re.sub(r"<think>.*?</think>", "", reply or "", flags=re.S)
+    found = {}
+    for line in text.splitlines():
+        m = re.match(r"\s*(\d+)\s*[.)、:：]\s*(.*)", line)
+        if m:
+            i = int(m.group(1))
+            if 1 <= i <= n and i not in found:
+                found[i] = _unquote(m.group(2).strip())
+    return [found.get(i, "") for i in range(1, n + 1)]
+
+
+def clearly_english(text):
+    """Latin-only text with real English words in it: leave it on the screenshot as it is."""
+    if has_foreign_script(text) or re.search(r"[\u00c0-\u024f¿¡]", text):
+        return False
+    words = [w.replace("'", "") for w in re.findall(r"[a-z']+", text.lower())]
+    return any(w in ENGLISH_COMMON and w not in AMBIGUOUS_WORDS for w in words) and looks_english(text)
 
 
 class Translator(threading.Thread):
@@ -2401,8 +2461,13 @@ HOTKEY_LOCK_LABEL = "Ctrl+Alt+L"  # lock / unlock the captions
 HOTKEY_HIDE_LABEL = "Ctrl+Alt+H"  # hide / show the captions
 
 
+_HOTKEY_THREAD = [0]  # id of the thread that owns the hotkeys (Windows)
+WM_ESC_HOTKEY = 0x8001  # WM_APP + 1: turn the Esc hotkey on (wParam 1) or off (0)
+ESC_ID = 5
+
+
 def start_hotkey(callback):
-    """Global hotkeys that work inside games. Calls callback("region") or callback("full") from a thread."""
+    """Global hotkeys that work inside games. Calls callback("region"), callback("full") etc. from a thread."""
     if sys.platform != "win32":
         return
 
@@ -2417,12 +2482,33 @@ def start_hotkey(callback):
         for hid, (_kind, key, label) in keys.items():
             if not user32.RegisterHotKey(None, hid, mods, ord(key)):
                 log(f"Couldn't register {label} (another app is using it).")
+        _HOTKEY_THREAD[0] = ctypes.windll.kernel32.GetCurrentThreadId()
         msg = wintypes.MSG()
         while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
-            if msg.message == 0x0312 and msg.wParam in keys:  # WM_HOTKEY
-                callback(keys[msg.wParam][0])
+            if msg.message == 0x0312:  # WM_HOTKEY
+                if msg.wParam == ESC_ID:
+                    callback("escape")
+                elif msg.wParam in keys:
+                    callback(keys[msg.wParam][0])
+            elif msg.message == WM_ESC_HOTKEY:
+                if msg.wParam:
+                    user32.RegisterHotKey(None, ESC_ID, 0x4000, 0x1B)  # VK_ESCAPE, no modifiers
+                else:
+                    user32.UnregisterHotKey(None, ESC_ID)
 
     threading.Thread(target=run, daemon=True).start()
+
+
+def set_escape_hotkey(on):
+    """Esc closes a translated screenshot while one is showing; the rest of the time the game keeps Esc."""
+    if sys.platform != "win32" or not _HOTKEY_THREAD[0]:
+        return
+    try:
+        import ctypes
+
+        ctypes.windll.user32.PostThreadMessageW(_HOTKEY_THREAD[0], WM_ESC_HOTKEY, 1 if on else 0, 0)
+    except Exception as e:
+        log("Esc hotkey unavailable:", e)
 
 
 def script_font(text):
@@ -2445,25 +2531,6 @@ def grab_screen():
     if sys.platform == "win32":
         return ImageGrab.grab()
     return ImageGrab.grab(xdisplay=os.environ.get("DISPLAY"))
-
-
-def read_and_translate(image, status=log):
-    """Send a screenshot to the local vision model. Returns (original, english)."""
-    import base64
-    import io
-
-    w, h = image.size
-    scale = 1600 / max(w, h) if max(w, h) > 1600 else (2 if max(w, h) < 500 else 1)
-    if scale != 1:
-        image = image.resize((max(1, int(w * scale)), max(1, int(h * scale))))
-    png = io.BytesIO()
-    image.convert("RGB").save(png, "PNG")
-    data_uri = "data:image/png;base64," + base64.b64encode(png.getvalue()).decode()
-    reply = HOST.chat(VISION_MODEL, [{"role": "user", "content": [
-        {"type": "image_url", "image_url": {"url": data_uri}},
-        {"type": "text", "text": SCREEN_PROMPT},
-    ]}], max_tokens=1500, temperature=0.1, timeout=180, status=status)
-    return parse_screen(reply)
 
 
 class Snipper:
@@ -2512,88 +2579,480 @@ class Snipper:
         self.win.destroy()
 
 
-class ResultPopup:
-    def __init__(self, root, box):
+class Cancelled(Exception):
+    pass
+
+
+class ScreenJob:
+    """One screenshot being translated. origin = where the image sits on screen; full = whole screen."""
+
+    def __init__(self, image, origin, full):
+        self.image, self.origin, self.full = image, origin, full
+        self.cancelled = False
+
+    def check(self, *_):
+        if self.cancelled:
+            raise Cancelled()
+
+
+VISION_MIN_PIXELS = 1024 * 32 * 32  # Qwen3-VL places text boxes reliably from ~1,000 image tokens up
+VISION_MAX_PIXELS = 1600 * 32 * 32  # ~1700x960: small game text stays readable, video memory stays modest
+
+
+def vision_image(image):
+    """The screenshot scaled into the size range Qwen3-VL reads best. Returns (data URI, (width, height))."""
+    import base64
+    import io
+
+    from PIL import Image
+
+    w, h = image.size
+    area = w * h
+    scale = 1.0
+    if area > VISION_MAX_PIXELS:
+        scale = (VISION_MAX_PIXELS / area) ** 0.5
+    elif area < VISION_MIN_PIXELS:
+        scale = min(8.0, (VISION_MIN_PIXELS / area) ** 0.5)  # small boxes: enlarge the text
+    if scale != 1.0:
+        image = image.resize((max(32, round(w * scale)), max(32, round(h * scale))),
+                             Image.LANCZOS if scale < 1 else Image.BICUBIC)
+    png = io.BytesIO()
+    image.convert("RGB").save(png, "PNG", compress_level=1)
+    return "data:image/png;base64," + base64.b64encode(png.getvalue()).decode(), image.size
+
+
+def spot_text(job, status=log):
+    """Every line of text in the screenshot: [{'box': (x1, y1, x2, y2) in screenshot pixels, 'text': str}]."""
+    W, H = job.image.size
+    uri, (sent_w, sent_h) = vision_image(job.image)
+    found = [0]
+
+    def progress(so_far):
+        job.check()
+        n = so_far.count("bbox_2d")
+        if n != found[0]:
+            found[0] = n
+            status(f"Reading text... {n} found")
+
+    status("Reading text...")
+    reply = HOST.chat(VISION_MODEL, [{"role": "user", "content": [
+        {"type": "image_url", "image_url": {"url": uri}},
+        {"type": "text", "text": SPOT_PROMPT},
+    ]}], max_tokens=4000, temperature=0.1, timeout=240, status=status, on_text=progress)
+    job.check()
+    raw = parse_spots(reply)
+    # Qwen3-VL gives positions on a 0-999 scale; fall back to pixels of the image it was sent if it didn't
+    relative = all(max(s["box"]) <= 1000 for s in raw)
+    sx, sy = (999, 999) if relative else (sent_w, sent_h)
+    spots, seen = [], set()
+    for s in raw:
+        x1, y1, x2, y2 = s["box"]
+        box = tuple(round(min(1.0, max(0.0, v / d)) * size)
+                    for v, d, size in ((x1, sx, W), (y1, sy, H), (x2, sx, W), (y2, sy, H)))
+        key = (s["text"], tuple(v // 8 for v in box))
+        if box[2] - box[0] < 3 or box[3] - box[1] < 3 or key in seen:  # empty or repeated entries
+            continue
+        seen.add(key)
+        spots.append({"box": box, "text": s["text"]})
+    return spots
+
+
+_NO_SPACES = re.compile(r"[　-〿぀-ヿ㐀-鿿豈-﫿＀-￯]")  # Chinese/Japanese
+_SENTENCE_END = tuple("。！？!?…:：")
+
+
+def _runs_on(prev, line):
+    """Is `line` the next line of the same sentence as `prev` (a wrapped paragraph or two-line subtitle)?
+    Kept strict so menus, lists, chat messages and bilingual subtitles stay separate."""
+    ax1, ay1, ax2, ay2 = prev["box"]
+    bx1, by1, bx2, by2 = line["box"]
+    ha, hb = ay2 - ay1, by2 - by1
+    h = (ha + hb) / 2
+    a, b = prev["text"].rstrip(), line["text"].strip()
+    return (max(ha, hb) <= 1.35 * min(ha, hb)                    # same text size
+            and -0.25 * h <= by1 - ay2 <= 0.6 * h                 # directly underneath
+            and (abs(bx1 - ax1) <= 1.2 * h or abs((bx1 + bx2) - (ax1 + ax2)) <= 3 * h)  # left- or centre-aligned
+            and ax2 - ax1 >= 6 * h                                # a full line, not a short label
+            and not a.endswith(_SENTENCE_END)
+            and not re.match(r"\s*(\[[^\]]{1,24}\]|\S{1,24}[:：])", b)  # "[Team] name:" starts a new chat message
+            and has_foreign_script(a) == has_foreign_script(b)
+            and not clearly_english(a) and not clearly_english(b))
+
+
+def group_lines(spots):
+    """Lines -> blocks to translate as one: [{'lines': [...], 'text': str, 'box': (x1, y1, x2, y2)}]."""
+    blocks = []
+    for s in spots:
+        b = blocks[-1] if blocks else None
+        if b and _runs_on(b["lines"][-1], s):
+            glue = "" if _NO_SPACES.match(b["text"][-1]) and _NO_SPACES.match(s["text"][0]) else " "
+            b["lines"].append(s)
+            b["text"] += glue + s["text"]
+            b["box"] = tuple(f(p, q) for f, p, q in zip((min, min, max, max), b["box"], s["box"]))
+        else:
+            blocks.append({"lines": [s], "text": s["text"], "box": s["box"]})
+    return blocks
+
+
+def screen_needs_translation(text):
+    if not re.search(r"[^\W\d_]", text):  # no letters: numbers, times, scores, symbols
+        return False
+    return not clearly_english(text)
+
+
+def _same_text(a, b):
+    def norm(s):
+        return re.sub(r"[\W_]+", "", s.lower())
+
+    return norm(a) == norm(b)
+
+
+def translate_screen_text(texts, cfg, job, status=log):
+    prompt = SCREEN_TRANSLATE_PROMPT
+    topic, words = (cfg.get("topic") or "").strip(), parse_words(cfg.get("words"))
+    if topic:
+        prompt += f"\nWhat's on screen: {topic}"
+    if words:
+        prompt += "\nNames and terms that may appear: " + ", ".join(words)
+    items = "\n".join(f"{i}. {' '.join(t.split())}" for i, t in enumerate(texts, 1))
+    status(f"Translating {len(texts)} line{'' if len(texts) == 1 else 's'}...")
+    reply = HOST.chat(VISION_MODEL, [{"role": "system", "content": prompt}, {"role": "user", "content": items}],
+                      max_tokens=min(3000, 100 + 80 * len(texts)), temperature=0.2, timeout=180,
+                      status=status, on_text=job.check)
+    job.check()
+    return parse_numbered(reply, len(texts))
+
+
+def read_screenshot(job, cfg, status=log):
+    """Finds the text in job.image and translates whatever isn't English.
+    Returns the text blocks; the ones that got an 'eng' are painted over."""
+    blocks = group_lines(spot_text(job, status))
+    todo = [b for b in blocks if screen_needs_translation(b["text"])]
+    if todo:
+        for b, eng in zip(todo, translate_screen_text([b["text"] for b in todo], cfg, job, status)):
+            if eng and not _same_text(eng, b["text"]):
+                b["eng"] = eng
+    return blocks
+
+
+# ---- painting the English onto the screenshot ----
+_FONTS = {}
+
+
+def paint_font(size, text=""):
+    """Font for the English painted onto screenshots (with a fallback for any non-Latin words in it)."""
+    if re.search(r"[가-힯]", text):
+        kind, files = "ko", ["malgun.ttf", "NotoSansCJK-Medium.ttc", "NotoSansCJK-Regular.ttc"]
+    elif re.search(r"[぀-ヿ]", text):
+        kind, files = "ja", ["YuGothM.ttc", "meiryo.ttc", "NotoSansCJK-Medium.ttc", "NotoSansCJK-Regular.ttc"]
+    elif has_foreign_script(text):
+        kind, files = "cjk", ["msyh.ttc", "NotoSansCJK-Medium.ttc", "NotoSansCJK-Regular.ttc"]
+    else:
+        kind, files = "latin", []
+    files = files + ["seguisb.ttf", "segoeui.ttf", "arial.ttf", "DejaVuSans-Bold.ttf", "DejaVuSans.ttf"]
+    key = (kind, size)
+    if key not in _FONTS:
+        from PIL import ImageFont
+
+        font = None
+        for name in files:
+            try:
+                font = ImageFont.truetype(name, size)
+                break
+            except OSError:
+                continue
+        if font is None:
+            try:
+                font = ImageFont.load_default(size)
+            except TypeError:  # Pillow older than 10.1
+                font = ImageFont.load_default()
+        _FONTS[key] = font
+    return _FONTS[key]
+
+
+def _luminance(c):
+    def lin(v):
+        v = float(v) / 255
+        return v / 12.92 if v <= 0.04045 else ((v + 0.055) / 1.055) ** 2.4
+
+    r, g, b = (lin(v) for v in c[:3])
+    return 0.2126 * r + 0.7152 * g + 0.0722 * b
+
+
+def _contrast(a, b):
+    lo, hi = sorted((_luminance(a), _luminance(b)))
+    return (hi + 0.05) / (lo + 0.05)
+
+
+def _box_colours(px, box):
+    """(background at the top, background at the bottom, text colour) of a box in the screenshot."""
+    import numpy as np
+
+    H, W = px.shape[:2]
+    x1, y1, x2, y2 = box
+    m = 3
+    X1, Y1, X2, Y2 = max(0, x1 - m), max(0, y1 - m), min(W, x2 + m), min(H, y2 + m)
+    top = px[Y1:max(Y1 + 1, y1), X1:X2].reshape(-1, 3)
+    bottom = px[min(y2, Y2 - 1):Y2, X1:X2].reshape(-1, 3)
+    sides = np.concatenate([px[Y1:Y2, X1:max(X1 + 1, x1)].reshape(-1, 3),
+                            px[Y1:Y2, min(x2, X2 - 1):X2].reshape(-1, 3)])
+    bg = np.median(np.concatenate([top, bottom, sides]), axis=0)
+    bg_top = np.median(top, axis=0) if len(top) else bg
+    bg_bottom = np.median(bottom, axis=0) if len(bottom) else bg
+    if np.abs(bg_top - bg_bottom).sum() < 24:  # flat background
+        bg_top = bg_bottom = bg
+    inner = px[y1:y2, x1:x2].reshape(-1, 3).astype(float)
+    fg = None
+    if len(inner):
+        dist = np.abs(inner - bg).sum(axis=1)
+        if dist.max() > 60:  # the strokes of the letters: the pixels furthest from the background colour
+            fg = np.median(inner[dist >= 0.6 * dist.max()], axis=0)
+    if fg is None or _contrast(fg, bg) < 3.0:  # keep it readable
+        fg = (255, 255, 255) if _contrast((255, 255, 255), bg) >= _contrast((16, 16, 16), bg) else (16, 16, 16)
+    return tuple(int(v) for v in bg_top), tuple(int(v) for v in bg_bottom), tuple(int(v) for v in fg)
+
+
+def _wrap(draw, text, font, width, force=False):
+    """Greedy word wrap; force=True also splits words too long for a line on their own."""
+    lines, cur = [], ""
+    for word in text.split():
+        trial = f"{cur} {word}" if cur else word
+        if not cur or draw.textlength(trial, font=font) <= width:
+            cur = trial
+        else:
+            lines.append(cur)
+            cur = word
+        while force and len(cur) > 1 and draw.textlength(cur, font=font) > width:
+            k = len(cur) - 1
+            while k > 1 and draw.textlength(cur[:k], font=font) > width:
+                k -= 1
+            lines.append(cur[:k])
+            cur = cur[k:]
+    if cur:
+        lines.append(cur)
+    return lines or [""]
+
+
+def _fit(draw, text, box, line_h, n_lines, centred, W, H):
+    """The biggest readable font for the English in the box. Text may spill sideways a little (to the right,
+    or both ways for centred text) rather than become tiny; if nothing fits, the box grows downward.
+    Returns (font, size, lines, line height, painted box)."""
+    x1, y1, x2, y2 = box
+    bw, bh = x2 - x1, y2 - y1
+    s_hi = int(max(10, min(72, line_h * 0.8)))
+    s_lo = int(max(10, min(s_hi, line_h * 0.5)))
+    best = None
+    for grow in ((1.0, 1.35, 1.7) if n_lines == 1 else (1.0, 1.15)):
+        width = min(W - 4, bw * grow)
+        for size in range(s_hi, s_lo - 1, -1):
+            font = paint_font(size, text)
+            lines = _wrap(draw, text, font, width)
+            if (max(draw.textlength(ln, font=font) for ln in lines) <= width
+                    and len(lines) * size * 1.2 <= bh * 1.08 + 2):
+                # bigger text is better; spilling sideways or onto extra lines is worse
+                score = size / line_h - (grow - 1) * 0.35 - max(0, len(lines) - n_lines) * 0.25
+                if best is None or score > best[0]:
+                    best = (score, size, lines)
+                break
+    if best:
+        _, size, lines = best
+    else:
+        size = s_lo
+        lines = _wrap(draw, text, paint_font(size, text), min(W - 4, bw * (1.7 if n_lines == 1 else 1.0)),
+                      force=True)
+    font, lh = paint_font(size, text), size * 1.2
+    need_w = max(draw.textlength(ln, font=font) for ln in lines) + 2 * max(2, size * 0.25)
+    if need_w > bw:
+        left = (x1 + x2) / 2 - need_w / 2 if centred else x1
+        left = max(0, min(W - need_w, left))
+        x1, x2 = int(left), int(min(W, left + need_w + 1))
+    need_h = len(lines) * lh + size * 0.3
+    if need_h > bh:  # lengthen downward (or upward at the bottom edge)
+        y2 = int(min(H, y1 + need_h + 1))
+        y1 = int(max(0, y2 - need_h - 1))
+    return font, size, lines, lh, (x1, y1, x2, y2)
+
+
+def paint_translation(image, blocks):
+    """The screenshot with each translated block's English drawn over its original text, like Google Lens."""
+    import numpy as np
+    from PIL import Image, ImageDraw
+
+    base = image.convert("RGB")
+    px = np.asarray(base).copy()  # colours always come from the untouched screenshot
+    out = base.copy()
+    W, H = out.size
+    draw = ImageDraw.Draw(out)
+    todo = []
+    for b in blocks:
+        if not b.get("eng"):
+            continue
+        x1, y1, x2, y2 = b["box"]
+        line_h = sum(ln["box"][3] - ln["box"][1] for ln in b["lines"]) / len(b["lines"])
+        pad = max(2, round(line_h * 0.12))
+        box = (max(0, x1 - pad), max(0, y1 - pad), min(W, x2 + pad), min(H, y2 + pad))
+        top, bottom, fg = _box_colours(px, b["box"])
+        centred = abs((x1 + x2) / 2 - W / 2) < W * 0.1  # subtitles, titles, dialog buttons
+        font, size, lines, lh, rect = _fit(draw, b["eng"], box, line_h, len(b["lines"]), centred, W, H)
+        todo.append((rect, top, bottom, fg, font, size, lines, lh, centred))
+    # every background first, then all the text, so a box that grew never hides a neighbour's English
+    for (x1, y1, x2, y2), top, bottom, *_ in todo:
+        w, h = x2 - x1, y2 - y1
+        if w < 1 or h < 1:
+            continue
+        t = np.linspace(0.0, 1.0, h)[:, None]
+        rows = np.array(top, float)[None, :] * (1 - t) + np.array(bottom, float)[None, :] * t
+        patch = Image.fromarray(np.repeat(rows[:, None, :], w, axis=1).round().astype(np.uint8), "RGB")
+        mask = Image.new("L", (w, h), 0)
+        ImageDraw.Draw(mask).rounded_rectangle((0, 0, w - 1, h - 1), radius=max(1, min(6, h // 4)), fill=255)
+        out.paste(patch, (x1, y1), mask)
+    for (x1, y1, x2, y2), _top, _bottom, fg, font, size, lines, lh, centred in todo:
+        y = y1 + ((y2 - y1) - len(lines) * lh) / 2 + lh / 2
+        for ln in lines:
+            if centred:
+                x, anchor = (x1 + x2) / 2, "mm"
+            else:
+                x, anchor = x1 + max(2, size * 0.25), "lm"
+            try:
+                draw.text((x, y), ln, font=font, fill=fg, anchor=anchor)
+            except ValueError:  # bitmap fallback font without anchor support
+                draw.text((x1 + 2, y - size / 2), ln, font=font, fill=fg)
+            y += lh
+    return out
+
+
+ACCENT = "#4aa3ff"
+PANEL = "#161a20"
+
+
+class LensView:
+    """The screenshot shown back exactly where it was taken, with the English painted over the original
+    text. Click it, press Esc or press the hotkey again to close it; right-click copies the English."""
+    BORDER = 2
+    STRIP = 24
+
+    def __init__(self, root, on_close):
+        import tkinter as tk
+
+        self.root, self.on_close = root, on_close
+        self.win = w = tk.Toplevel(root)
+        w.overrideredirect(True)
+        w.configure(bg=ACCENT)
+        self.c = tk.Canvas(w, highlightthickness=0, bd=0, bg=PANEL, cursor="hand2")
+        self.c.pack()
+        self.c.bind("<ButtonRelease-1>", lambda e: self.close())
+        self.c.bind("<Button-3>", lambda e: self.copy())
+        self.is_open = False
+        self.photo = None
+        self.english = ""
+        self.full = False
+        self.hint = self.pill = None
+        # created once and hidden, so showing it later never takes focus from the game
+        w.geometry("1x1+-200+-200")
+        game_safe(w)
+        set_window_alpha(w, 1.0)
+        show_window(w, False)
+
+    def show(self, image, origin, full, hint, english=""):
+        from PIL import ImageTk
+
+        c = self.c
+        c.delete("all")
+        self.photo = ImageTk.PhotoImage(image)
+        self.english, self.full = english, full
+        iw, ih = image.size
+        x, y = origin
+        if full:
+            b, cw, ch, img_y, gy = 0, iw, ih, 0, y
+            self.strip_y = None
+        else:
+            b = self.BORDER
+            cw, ch = max(iw, 290), ih + self.STRIP  # wide enough for the hint underneath
+            above = y + ih + b + self.STRIP > self.root.winfo_screenheight()  # no room underneath
+            img_y = self.STRIP if above else 0
+            self.strip_y = 0 if above else ih
+            gy = y - b - (self.STRIP if above else 0)
+        c.config(width=cw, height=ch)
+        c.create_image(0, img_y, image=self.photo, anchor="nw")
+        c.pack_configure(padx=b, pady=b)
+        self.pill = self.hint = None
+        self.set_hint(hint)
+        self.win.geometry(f"{cw + 2 * b}x{ch + 2 * b}+{x - b}+{gy}")
+        if not self.is_open:
+            show_window(self.win, True)
+            keep_on_top(self.win)
+            self.is_open = True
+
+    def set_hint(self, text):
+        c = self.c
+        if self.hint is None:
+            if self.full:  # a small label over the top of the screenshot
+                self.pill = c.create_rectangle(0, 0, 0, 0, fill=PANEL, outline=ACCENT)
+                self.hint = c.create_text(int(c["width"]) // 2, 22, fill="white", font=("Segoe UI", 11, "bold"))
+            else:  # a strip under (or over) the picked box
+                sy = self.strip_y
+                c.create_rectangle(0, sy, int(c["width"]), sy + self.STRIP, fill=PANEL, outline="")
+                self.hint = c.create_text(7, sy + self.STRIP // 2, anchor="w", fill="#cfd6e0",
+                                          font=("Segoe UI", 9))
+        c.itemconfigure(self.hint, text=text)
+        if self.pill is not None:
+            x1, y1, x2, y2 = c.bbox(self.hint)
+            c.coords(self.pill, x1 - 14, y1 - 6, x2 + 14, y2 + 6)
+
+    def copy(self):
+        if self.english:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(self.english)
+            self.set_hint("Copied the English  ·  click to close")
+
+    def close(self):
+        if self.is_open:
+            self.is_open = False
+            show_window(self.win, False)
+            self.c.delete("all")
+            self.photo = None
+            self.on_close()
+
+
+class Toast:
+    """A small note at the top of the screen ("Reading text..."). Never takes focus or clicks."""
+
+    def __init__(self, root):
         import tkinter as tk
 
         self.root = root
         self.win = w = tk.Toplevel(root)
         w.overrideredirect(True)
-        w.configure(bg="#161a20", highlightbackground="#4aa3ff", highlightthickness=1)
-        self.box = box
-        self.eng = tk.Label(w, bg="#161a20", fg="white", font=("Segoe UI", 15, "bold"),
-                            justify="left", anchor="w", wraplength=640, text="Reading screenshot...")
-        self.eng.pack(fill="x", padx=14, pady=(12, 4))
-        self.orig = tk.Label(w, bg="#161a20", fg="#a8dcff", justify="left", anchor="w", wraplength=640)
-        self.orig.pack(fill="x", padx=14)
-        bar = tk.Frame(w, bg="#161a20")
-        bar.pack(fill="x", padx=10, pady=10)
-        self.copy_btn = tk.Button(bar, text="Copy English", relief="flat", bg="#2a3240", fg="white",
-                                  activebackground="#3a4458", command=self.copy, state="disabled")
-        self.copy_btn.pack(side="left", padx=4)
-        tk.Button(bar, text="Close", relief="flat", bg="#2a3240", fg="white",
-                  activebackground="#3a4458", command=self.close).pack(side="right", padx=4)
-        self.timer = tk.Label(bar, bg="#161a20", fg="#6c7686", font=("Segoe UI", 9))
-        self.timer.pack(side="right", padx=6)
-        self.english = ""
-        self.closed = False
-        self.deadline = None
-        self.hovering = False
-        for wdg in (w, self.eng, self.orig):
-            wdg.bind("<Enter>", lambda e: setattr(self, "hovering", True))
-            wdg.bind("<Leave>", lambda e: setattr(self, "hovering", False))
-        self.place()
-        game_safe(w)  # shows on top of the game without taking focus
-        self._tick()
+        w.configure(bg=ACCENT)
+        self.label = tk.Label(w, bg=PANEL, fg="white", font=("Segoe UI", 11, "bold"), padx=16, pady=7)
+        self.label.pack(padx=1, pady=1)
+        self.visible = False
+        self.hide_at = None
+        w.geometry("1x1+-200+-200")
+        game_safe(w, click_through=True)
+        set_window_alpha(w, 0.94)
+        show_window(w, False)
 
-    def _tick(self):
-        """Closes itself a while after the answer shows (paused while the mouse is over it)."""
-        if self.closed:
-            return
-        if self.deadline is not None:
-            if self.hovering:
-                self.deadline = max(self.deadline, time.monotonic() + 3)
-            left = self.deadline - time.monotonic()
-            if left <= 0:
-                return self.close()
-            self.timer.config(text=f"closes in {int(left) + 1}s")
-        self.win.after(250, self._tick)
-
-    def _start_timer(self, chars):
-        self.deadline = time.monotonic() + min(30, 8 + chars * 0.06)
-
-    def place(self):
+    def show(self, text, seconds=None, color="white"):
+        self.label.config(text=text, fg=color)
         self.win.update_idletasks()
-        sw, sh = self.win.winfo_screenwidth(), self.win.winfo_screenheight()
         ww, wh = self.win.winfo_reqwidth(), self.win.winfo_reqheight()
-        x1, y1, x2, y2 = self.box
-        x = min(max(0, x1), sw - ww)
-        y = y2 + 8 if y2 + 8 + wh < sh else max(0, y1 - wh - 8)
-        self.win.geometry(f"+{x}+{y}")
+        self.win.geometry(f"{ww}x{wh}+{(self.root.winfo_screenwidth() - ww) // 2}+24")
+        if not self.visible:
+            show_window(self.win, True)
+            keep_on_top(self.win)
+            self.visible = True
+        self.hide_at = time.monotonic() + seconds if seconds else None
 
-    def show(self, original, english):
-        self.english = english
-        self.eng.config(text=english or "(no text found)")
-        self.orig.config(text=original if original and original != "(none)" else "",
-                         font=(script_font(original), 12))
-        self.copy_btn.config(state="normal")
-        self.place()
-        self._start_timer(len(english or "") + len(original or ""))
+    def hide(self):
+        if self.visible:
+            show_window(self.win, False)
+            self.visible = False
+        self.hide_at = None
 
-    def error(self, msg):
-        self.eng.config(text=msg, fg="#ff8f8f")
-        self.place()
-        self._start_timer(len(msg))
-
-    def copy(self):
-        self.root.clipboard_clear()
-        self.root.clipboard_append(self.english)
-        self.copy_btn.config(text="Copied!")
-
-    def close(self):
-        if not self.closed:
-            self.closed = True
-            self.win.destroy()
+    def tick(self):
+        if self.hide_at is not None and time.monotonic() > self.hide_at:
+            self.hide()
 
 
 # --------------------------------------------------------------------------
@@ -2912,6 +3371,9 @@ class App:
         self.root = tk.Tk()
         self.root.report_callback_exception = lambda *a: log("".join(traceback.format_exception(*a)))
         self.overlay = Overlay(self.root, self.cfg, self.settings_changed)
+        self.lens = LensView(self.root, self._lens_closed)  # translated screenshots
+        self.toast = Toast(self.root)
+        self.shot_job = None  # screenshot being read/translated right now
         self.build_ui()
         self.root.protocol("WM_DELETE_WINDOW", self.quit)
         self.load_asr()
@@ -3181,25 +3643,36 @@ class App:
             self.history_win = HistoryWindow(self.root, self.history, self.cfg,
                                              ICON_PATH if os.path.exists(ICON_PATH) else None)
 
-    def _translate_image(self, image, box):
-        for p in getattr(self, "popups", []):  # one answer on screen at a time
-            p.close()
-        popup = ResultPopup(self.root, box)
-        self.popups = [popup]
+    def _translate_image(self, image, origin, full):
+        """Reads the text in the screenshot, translates it and shows the screenshot again with the English
+        painted over the original text. A picked box shows straight away and fills in when ready."""
+        job = ScreenJob(image, origin, full)
+        self.shot_job = job
+        if full:
+            self.toast.show(f"Reading the screen...   ({HOTKEY_FULL_LABEL} again to cancel)")
+        else:
+            self.lens.show(image, origin, False, "Translating...   (click or Esc to cancel)")
+            set_escape_hotkey(True)
 
         def work():
             try:
                 t0 = time.monotonic()
-                orig, eng = read_and_translate(
-                    image, status=lambda m: self.q.put(("screen_status", popup, m)))
-                log(f"Screenshot: {orig!r} -> {eng!r} ({time.monotonic() - t0:.1f}s)")
-                self.q.put(("screen_result", popup, orig, eng, None))
+                blocks = read_screenshot(job, self.cfg, status=lambda m: self.q.put(("screen_status", job, m)))
+                done = [b for b in blocks if b.get("eng")]
+                picture = paint_translation(image, blocks) if done else None
+                log(f"Screenshot: {len(blocks)} text blocks, {len(done)} translated "
+                    f"({time.monotonic() - t0:.1f}s)")
+                self.q.put(("screen_result", job, blocks, picture, None))
+            except Cancelled:
+                log("Screenshot translation cancelled")
             except Exception as e:
                 log(traceback.format_exc())
-                self.q.put(("screen_result", popup, "", "", str(e)))
+                self.q.put(("screen_result", job, None, None, str(e)))
             # put the subtitle translator back on the GPU so the next line isn't delayed
+            # (unless another screenshot has already started)
             tr = self.cfg["translator"]
-            if tr not in ("off", VISION_MODEL) and self.translator.ready_model:
+            if (tr not in ("off", VISION_MODEL) and self.translator.ready_model
+                    and self.shot_job in (None, job)):
                 try:
                     HOST.use(tr)
                 except Exception as e:
@@ -3207,11 +3680,50 @@ class App:
 
         threading.Thread(target=work, daemon=True).start()
 
+    def show_screen_result(self, job, blocks, picture, err):
+        if job is not self.shot_job:
+            return  # closed / cancelled meanwhile
+        self.shot_job = None
+        if err:
+            self.lens.close()
+            self.toast.show(f"Couldn't translate the screenshot: {err}", 8, "#ff8f8f")
+            return
+        done = [b for b in blocks if b.get("eng")]
+        if not done:
+            self.lens.close()
+            self.toast.show("Nothing to translate - it's all English already" if blocks else "No text found", 3)
+            return
+        english = "\n".join(b["eng"] for b in done)
+        self.history.screenshot("\n".join(b["text"] for b in done), english)
+        self.toast.hide()
+        if job.full:
+            hint = (f"{len(done)} translated  ·  click, Esc or {HOTKEY_FULL_LABEL} to close  ·  "
+                    "right-click to copy the English")
+        else:
+            hint = "Click or Esc to close  ·  right-click copies"
+        self.lens.show(picture, job.origin, job.full, hint, english)
+        set_escape_hotkey(True)
+
+    def _lens_closed(self):
+        set_escape_hotkey(False)
+        if self.shot_job is not None:  # closed before the translation was ready
+            self.shot_job.cancelled = True
+            self.shot_job = None
+
+    def close_screen_translation(self):
+        """Closes the translated screenshot, or cancels one in progress. False if there was none."""
+        busy = self.shot_job is not None or self.lens.is_open
+        if self.shot_job is not None:
+            self.shot_job.cancelled = True
+            self.shot_job = None
+        self.lens.close()
+        self.toast.hide()
+        return busy
+
     def _hide_for_shot(self):
         """Make our own windows invisible for a moment so they're not in the screenshot."""
+        self.close_screen_translation()  # e.g. the button was used while a translated screenshot was showing
         self.overlay.hide_now()
-        for p in getattr(self, "popups", []):
-            p.close()
         self.root.update()
 
     def start_full_shot(self):
@@ -3228,8 +3740,7 @@ class App:
             return
         finally:
             self.overlay.apply()
-        sw = self.root.winfo_screenwidth()
-        self._translate_image(image, (sw // 2 - 330, 40, sw // 2 + 330, 40))
+        self._translate_image(image, (0, 0), True)
 
     def start_snip(self):
         if getattr(self, "_snipping", False):
@@ -3245,7 +3756,8 @@ class App:
             self.overlay.apply()
             self.root.after(30, lambda: give_focus_back(game))
             if args:
-                self._translate_image(*args)
+                image, box = args
+                self._translate_image(image, box[:2], False)
 
         try:
             snip = Snipper(self.root, finish)
@@ -3498,27 +4010,23 @@ class App:
                 elif kind == "dropped":
                     self.overlay.dropped(msg[1])
                 elif kind == "screenshot":
-                    if msg[1] == "full":
-                        self.start_full_shot()
-                    elif msg[1] == "region":
-                        self.start_snip()
+                    if msg[1] in ("full", "region", "escape"):
+                        # the same hotkey (or Esc) closes a translated screenshot, or cancels one in progress
+                        if not self.close_screen_translation() and msg[1] != "escape":
+                            self.start_full_shot() if msg[1] == "full" else self.start_snip()
                     elif msg[1] == "lock":
                         self.set_locked(not self.cfg["click_through"])
                     elif msg[1] == "hide":
                         self.toggle_visible()
                 elif kind == "screen_status":
-                    try:
-                        msg[1].eng.config(text=msg[2])
-                    except Exception:
-                        pass
+                    job, text = msg[1:]
+                    if job is self.shot_job:
+                        if job.full:
+                            self.toast.show(f"{text}   ({HOTKEY_FULL_LABEL} again to cancel)")
+                        elif self.lens.is_open:
+                            self.lens.set_hint(text)
                 elif kind == "screen_result":
-                    popup, orig, eng, err = msg[1:]
-                    if not err:
-                        self.history.screenshot(orig, eng)
-                    try:
-                        popup.error(err) if err else popup.show(orig, eng)
-                    except Exception:
-                        pass  # popup was closed already
+                    self.show_screen_result(*msg[1:])
                 elif kind == "error":
                     self.set_status(f"Audio error: {msg[1]}", "#d9534f")
                     self.overlay.status(f"Error: {msg[1]}", "#ff7b7b")
@@ -3529,6 +4037,7 @@ class App:
         except queue.Empty:
             pass
         self.overlay.tick(self.listener is not None)
+        self.toast.tick()
         self.history.tick()
         self.root.after(50, self.poll)
 
@@ -3585,11 +4094,15 @@ def prepare():
 
         from PIL import Image, ImageDraw
 
-        img = Image.new("RGB", (360, 90), "white")
-        ImageDraw.Draw(img).text((20, 30), "START GAME   OPTIONS", fill="black")
+        img = Image.new("RGB", (520, 180), (24, 28, 36))  # a small game menu in Chinese
+        draw = ImageDraw.Draw(img)
+        draw.text((40, 30), "开始游戏", font=paint_font(44, "开始游戏"), fill="white")
+        draw.text((40, 105), "设置", font=paint_font(44, "设置"), fill=(255, 210, 90))
         t0 = time.monotonic()
-        orig, eng = read_and_translate(img, say)
-        say(f"Screenshot test: read {orig!r}  ({time.monotonic() - t0:.1f} s)")
+        blocks = read_screenshot(ScreenJob(img, (0, 0), True), cfg, say)
+        paint_translation(img, blocks)
+        found = ", ".join(f"{b['text']} -> {b.get('eng') or '(kept)'}" for b in blocks) or "no text"
+        say(f"Screenshot test: {found}  ({time.monotonic() - t0:.1f} s)")
     finally:
         HOST.stop()
 

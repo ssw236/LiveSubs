@@ -17,7 +17,8 @@ fullscreen games while it runs.
 - **Voice detection.** Game sounds and music aren't mistaken for speech, and lines end at real pauses.
 - **Speaker colours.** Different voices get their own colour and number.
 - **Per-app audio.** Listen to everything, everything except some apps (e.g. Spotify), or only chosen apps.
-- **Screenshot translation.** Translate text on screen (menus, chat, signs) with a hotkey.
+- **Screenshot translation.** Press a hotkey and the screenshot comes back with English painted over the
+  foreign text, right where it was (like Google Lens). Works on menus, chat, signs and video subtitles.
 - **History.** A searchable, timestamped log of every translated line, saved as plain text.
 - **Game mode.** Much lighter on the CPU, GPU and video memory so games stay smooth (see below).
 - **Topic and custom words.** Tell it what you're watching and which names or terms to expect.
@@ -55,6 +56,17 @@ window to appear on top of the game.
 
 Drag the caption box to move it, scroll on it to resize the text, and right-click it for options.
 The **Background** slider fades only the box behind the text; set it to 0 for text with no box.
+
+## Translating text on screen
+
+Press `Ctrl+Alt+Y` for the whole screen, or `Ctrl+Alt+T` and drag a box around some text. The screenshot
+appears where it was taken, with English painted over every line that wasn't English already. Lines that
+belong to one sentence (a wrapped paragraph or a two-line subtitle) are translated together.
+
+- **Close it:** click it, press `Esc`, or press the same hotkey again (this also cancels one that's still
+  being read).
+- **Copy the English:** right-click it.
+- Every translated screenshot is saved in the history.
 
 ## Tips for better accuracy
 
