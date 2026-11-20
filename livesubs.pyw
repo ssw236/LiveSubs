@@ -934,6 +934,36 @@ def open_capture(cfg, on_error=log):
 # --------------------------------------------------------------------------
 # Speech -> text engines
 # --------------------------------------------------------------------------
+def use_windows_certificates():
+    """Check HTTPS certificates through Windows itself, the way browsers and pip do. On its own, Python only
+    trusts the root certificates already saved on the PC, and Windows saves many of those only once a
+    browser first needs one - so on a fresh PC, downloads from GitHub or Hugging Face could fail with
+    CERTIFICATE_VERIFY_FAILED. This also trusts certificates that antivirus or a work/school network added."""
+    import importlib
+
+    for name in ("truststore", "pip._vendor.truststore"):  # pip ships its own copy as a fallback
+        try:
+            importlib.import_module(name).inject_into_ssl()
+            return True
+        except Exception:
+            continue
+    log("Couldn't use Windows' certificate checks; using Python's own.")
+    return False
+
+
+def certificate_error(e):
+    import ssl
+
+    reason = getattr(e, "reason", None)
+    return (isinstance(e, ssl.SSLCertVerificationError) or isinstance(reason, ssl.SSLCertVerificationError)
+            or "CERTIFICATE_VERIFY_FAILED" in str(e))
+
+
+CERT_HELP = ("Couldn't confirm the download site's security certificate (CERTIFICATE_VERIFY_FAILED). "
+             "This is usually antivirus that scans secure connections, or a school/work network. Try "
+             "again with the antivirus' web/HTTPS scanning paused, or on another network.")
+
+
 def download(url, dest, status, label, attempts=5):
     """Downloads with a progress %, and resumes from where it stopped if the connection drops."""
     tmp = dest + ".part"
@@ -969,7 +999,9 @@ def download(url, dest, status, label, attempts=5):
                 return
             if attempt == attempts - 1:
                 raise
-        except Exception:
+        except Exception as e:
+            if certificate_error(e):  # retrying won't help
+                raise RuntimeError(CERT_HELP) from e
             if attempt == attempts - 1:
                 raise
         status(f"Connection dropped - resuming {label}...")
@@ -4465,6 +4497,7 @@ foreach ($dir in @([Environment]::GetFolderPath('Desktop'), [Environment]::GetFo
 
 
 def main():
+    use_windows_certificates()
     if "--probe-sv-gpu" in sys.argv:
         return probe_sensevoice_gpu()
     if "--prepare" in sys.argv:
