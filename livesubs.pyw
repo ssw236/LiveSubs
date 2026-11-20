@@ -947,7 +947,10 @@ class SenseVoiceASR:
 
         self._so = sherpa_onnx
         self.cpu_model, self.tokens = ensure_sensevoice(status)
-        use_gpu = device in ("auto", "cuda") and sensevoice_gpu_ok(status)
+        # Auto + Game mode stays on the CPU: on the GPU, SenseVoice needs ~1.5 GB of video memory
+        # (model + its own CUDA context) that the game and the translator need more.
+        want_gpu = device == "cuda" or (device == "auto" and not game_mode)
+        use_gpu = want_gpu and sensevoice_gpu_ok(status)
         if device == "cuda" and not use_gpu:
             status("GPU speech engine not available - using CPU (run the installer to add it)")
             log("SenseVoice: GPU requested but not available; using CPU")
@@ -1706,6 +1709,13 @@ class Listener(threading.Thread):
         # Two-pass: show the quick version now if it looks like real speech, then let Qwen3-ASR
         # re-listen in the background and correct (or remove) it.
         lang, need = self._classify(text, det)
+        if self.cfg.get("game_mode", True) and self.fast_pass_ok():
+            if not text:  # SenseVoice heard no words: game sounds, not speech
+                self.out.put(("dropped", line_id))
+                return
+            if det == "en" and not need:  # plain English: SenseVoice is already reliable here
+                self._publish("final", line_id, text, det, spk, audio16)
+                return
         shown = len(_PUNCT.sub("", text)) >= 3 and not (self.cfg.get("hide_english") and not need)
         if shown:
             self.out.put(("final", line_id, text, lang, self._wants_english(need), spk, True))
@@ -1861,9 +1871,12 @@ class Listener(threading.Thread):
                 end_line(False)
                 continue
 
+            if c.get("game_mode", True):
+                # Game mode: no live text. Re-transcribing the growing sentence every half second
+                # was most of LiveSubs' CPU use while people talked; each line is now decoded once.
+                continue
             now = time.monotonic()
-            step = self.asr.live_step * (1.5 if c.get("game_mode", True) else 1.0)
-            if now - last_run < step or not self.fast_pass_ok():
+            if now - last_run < self.asr.live_step or not self.fast_pass_ok():
                 continue
             last_run = now
             text, det = self.asr.transcribe(to16k([ch for ch, _ in chunks]), self.language(), False)
@@ -3300,8 +3313,8 @@ class App:
         self.cfg["game_mode"] = bool(self.game_var.get())
         save_settings(self.cfg)
         self.apply_game_mode()
-        if self.cfg["engine"] == "sensevoice":
-            self.load_asr()  # picks up the new thread count
+        if self.cfg["engine"] in ("sensevoice", "qwen3"):
+            self.load_asr()  # picks up the new thread count and CPU/GPU choice
 
     def set_locked(self, locked):
         """Locked = can't be dragged or resized, and clicks go straight through to the game."""
