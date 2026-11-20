@@ -35,14 +35,15 @@ also handles many other languages), or any language Whisper supports.
 - An NVIDIA GPU with 12 GB+ of video memory is recommended for the default translator
   (pick Qwen3 8B in the app if you have less; other GPUs may work through Vulkan)
 - About 19 GB of free disk space for the AI models
-- Python 3.12 (the installer looks for it and points you to the download if it's missing)
+- Python 3.12. If it's missing, the installer downloads it from python.org and installs it for you
+  (for your Windows user only, so no admin rights are needed)
 
 ## Install
 
 1. Download this repository (green **Code** button → **Download ZIP**) and unzip it, or `git clone` it.
-2. Double-click **Install LiveSubs.bat**. It installs the Python packages, downloads the models and creates
-   Desktop and Start menu shortcuts. The first run downloads about 19 GB; if it's interrupted, run it again
-   and it continues where it stopped.
+2. Double-click **Install LiveSubs.bat**. It installs Python 3.12 if you don't have it, then the Python
+   packages, downloads the models and creates Desktop and Start menu shortcuts. The first run downloads
+   about 19 GB; if it's interrupted, run it again and it continues where it stopped.
 3. Open **LiveSubs** from the Desktop shortcut.
 
 In games, use **Windowed Fullscreen** (borderless) display mode. Exclusive fullscreen doesn't allow any
