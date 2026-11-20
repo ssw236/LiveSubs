@@ -1,10 +1,9 @@
 """
 LiveSubs - real-time subtitles for whatever your PC is playing.
 
-Speech -> text:   SenseVoice (Chinese, Cantonese, Korean, Japanese, English - fast, runs on CPU)
-                  or Whisper (any language)
-Text -> English:  a local AI model (Qwen3, run by a built-in llama.cpp engine on your GPU) that translates for
-                  natural meaning, using the previous lines as context
+Speech -> text:   Qwen3-ASR and SenseVoice (Chinese, English, Korean, Japanese and more), or Whisper
+Text -> captions: a local AI model (Qwen3, run by a built-in llama.cpp engine on your GPU) that translates for
+                  natural meaning into English or another language, using the previous lines as context
 
 Everything runs offline on your PC after setup.
 
@@ -68,7 +67,26 @@ TRANSLATORS = {
     "Qwen3-VL 8B (faster, no wait after screenshots)": "qwen3-vl-8b",
     "Off": "off",
 }
-SHOW_MODES = {"Original + English": "both", "English only": "english", "Original only": "original"}
+SHOW_MODES = {"Original + translation": "both", "Translation only": "english", "Original only": "original"}
+
+# What the captions are translated into. (Scripts Tk can't lay out properly, like Arabic, are left out.)
+TARGETS = [
+    ("English", "en"), ("Chinese, Simplified (简体中文)", "zh"), ("Chinese, Traditional (繁體中文)", "zh-Hant"),
+    ("Korean (한국어)", "ko"), ("Japanese (日本語)", "ja"), ("Spanish (Español)", "es"),
+    ("French (Français)", "fr"), ("German (Deutsch)", "de"), ("Portuguese (Português)", "pt"),
+    ("Italian (Italiano)", "it"), ("Russian (Русский)", "ru"), ("Vietnamese (Tiếng Việt)", "vi"),
+    ("Thai", "th"), ("Indonesian (Bahasa Indonesia)", "id"), ("Filipino (Tagalog)", "tl"),
+    ("Turkish (Türkçe)", "tr"),
+]
+TARGET_SHORT = {"en": "English", "zh": "Chinese", "zh-Hant": "Chinese", "ko": "Korean", "ja": "Japanese",
+                "es": "Spanish", "fr": "French", "de": "German", "pt": "Portuguese", "it": "Italian",
+                "ru": "Russian", "vi": "Vietnamese", "th": "Thai", "id": "Indonesian", "tl": "Filipino",
+                "tr": "Turkish"}
+# how the translator is told which language to write
+TARGET_PROMPT_NAME = dict(TARGET_SHORT, **{
+    "zh": "Simplified Chinese (everyday Mandarin as spoken in mainland China)",
+    "zh-Hant": "Traditional Chinese (everyday Mandarin as spoken in Taiwan)",
+    "tl": "Filipino (Tagalog)"})
 
 LANGUAGES = [
     ("Auto-detect", ""), ("Chinese (Mandarin)", "zh"), ("Cantonese", "yue"), ("Korean", "ko"),
@@ -108,7 +126,7 @@ DEFAULTS = {
     "threshold": 0.008, "silence": 0.6, "max_seg": 8.0,
     "click_through": False, "autostart": True, "pos": None,
     "history": 2, "speakers": True, "save_history": True, "layout_v": 2,
-    "game_mode": True,
+    "game_mode": True, "target": "en", "both_ways": False,
 }
 
 _ASR_REL = "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models"
@@ -161,6 +179,66 @@ TRANSLATE_PROMPT = (
     "マジでヤバいって！  NOT \"Seriously it is dangerous!\" -> \"Dude, this is seriously bad!\"\n"
     "うるさいな、黙ってろ。  -> \"Ugh, shut up already.\"      なんでやねん -> \"Oh, come on!\"\n"
 )
+TRANSLATE_PROMPT_ANY = (
+    "You are a professional subtitle translator for streaming shows, anime, dramas, games and "
+    "livestreams. Translate the new line into {name} the way a native speaker would actually say it "
+    "in that situation - NOT word-for-word.\n"
+    "Rules:\n"
+    "- Match the register exactly: casual stays casual, rude stays rude, cute stays cute, "
+    "formal stays formal. Use everyday spoken {short}.\n"
+    "- Turn slang, internet slang and idioms into the natural {short} equivalent. Never translate "
+    "an idiom or slang term literally.\n"
+    "- Keep swearing and insults at the same strength - don't censor or soften them.\n"
+    "- The line comes from automatic speech recognition and may have wrong words, homophones or "
+    "missing words: translate what the speaker most likely MEANT.\n"
+    "- Speakers often mix languages in one sentence. Blend everything into ONE natural {short} line. "
+    "Names, and game terms or callouts that {short}-speaking players normally say in English, can stay "
+    "in English.\n"
+    "- If you are given two versions of the line from two speech recognizers, they heard the same "
+    "audio and may each be partly wrong: work out what was really said from both, then translate that.\n"
+    "- Use the earlier lines only as context (who's talking, what's going on). Keep names as names.\n"
+    "- Keep it short and readable like a real subtitle.\n"
+)
+TRANSLATE_EXTRA = {  # script rules and a few examples of the tone wanted
+    "zh": "- Write Simplified Chinese characters only, with Chinese punctuation.\n"
+          "\nExamples (literal -> how you should translate):\n"
+          "What the hell are you doing?  NOT \"你在做什么地狱？\" -> \"你在搞什么鬼？\"\n"
+          "That's insane!  -> \"绝了！\"      No way!  -> \"不是吧！\"      lol  -> \"哈哈哈\"\n"
+          "Nice shot!  -> \"好枪！\"      I'm one shot, someone heal me.  -> \"我残血了，谁奶我一口。\"\n"
+          "GG, we got thrown.  -> \"GG，这把被演了。\"      Bro, you're actually so bad.  -> \"兄弟，你是真的菜。\"\n",
+    "zh-Hant": "- Write Traditional Chinese characters only (Taiwan usage), with Chinese punctuation.\n"
+               "\nExamples (literal -> how you should translate):\n"
+               "What the hell are you doing?  NOT \"你在做什麼地獄？\" -> \"你在搞什麼鬼？\"\n"
+               "That's insane!  -> \"太扯了吧！\"      No way!  -> \"不會吧！\"      lol  -> \"笑死\"\n"
+               "Nice shot!  -> \"漂亮！\"      I'm one shot, someone heal me.  -> \"我殘血，誰來補我一下。\"\n"
+               "GG, we got thrown.  -> \"GG，這場被隊友雷了。\"      Bro, you're actually so bad.  -> \"兄弟，你真的很爛欸。\"\n",
+    "ko": "- Match how the speaker talks: 반말 for casual speech, 존댓말 for polite speech.\n"
+          "\nExamples (literal -> how you should translate):\n"
+          "What the hell are you doing?  -> \"너 지금 뭐 하는 거야?\"      That's insane!  -> \"미쳤다!\"\n"
+          "Nice shot!  -> \"나이스!\"      lol  -> \"ㅋㅋㅋ\"      GG, we got thrown.  -> \"GG, 이번 판 트롤 당했네.\"\n",
+    "ja": "\nExamples (literal -> how you should translate):\n"
+          "What the hell are you doing?  -> \"何やってんだよ？\"      That's insane!  -> \"ヤバすぎ！\"\n"
+          "Nice shot!  -> \"ナイス！\"      lol  -> \"ｗｗｗ\"      GG, we got thrown.  -> \"GG、戦犯いたわ。\"\n",
+}
+
+
+def translation_prompt(target):
+    """System prompt for translating speech into the caption language."""
+    if target == "en":
+        return TRANSLATE_PROMPT
+    name, short = TARGET_PROMPT_NAME.get(target, target), TARGET_SHORT.get(target, target)
+    return TRANSLATE_PROMPT_ANY.format(name=name, short=short) + TRANSLATE_EXTRA.get(target, "")
+
+
+def reply_format(target, fix):
+    if target == "en":
+        return FORMAT_FIX if fix else FORMAT_ENGLISH
+    name = TARGET_PROMPT_NAME.get(target, target)
+    if fix:
+        return FORMAT_FIX.replace("ENGLISH: <the natural English subtitle>", f"TRANSLATION: <the natural {name} subtitle>")
+    return f"\nReply with ONLY the {name} subtitle - no quotes, notes, labels, romanization or pinyin."
+
+
 FORMAT_ENGLISH = "\nReply with ONLY the English subtitle - no quotes, notes, labels or romanization."
 FORMAT_FIX = (
     "\nReply in exactly this format and nothing else:\n"
@@ -182,6 +260,18 @@ SCREEN_TRANSLATE_PROMPT = (
     "No notes, no quotes, no extra lines."
 )
 VISION_MODEL = "qwen3-vl-8b"
+
+
+def screen_prompt(target):
+    if target == "en":
+        return SCREEN_TRANSLATE_PROMPT
+    name, short = TARGET_PROMPT_NAME.get(target, target), TARGET_SHORT.get(target, target)
+    return (f"You translate text read from a screenshot (game UI, menus, chat, subtitles, signs, manga) into "
+            f"natural {name}. Each numbered item is one line or label, possibly misread by OCR: translate what "
+            "it most likely says. Keep buttons and labels short, keep names as names, and keep slang and tone "
+            f"(casual stays casual, rude stays rude). If an item is already in {short}, repeat it unchanged.\n"
+            "Reply with exactly one line per item, numbered the same way:\n1. <translation>\n2. <translation>\n"
+            "No notes, no quotes, no extra lines.")
 
 _line_ids = itertools.count(1)
 
@@ -243,6 +333,8 @@ def load_settings():
         cfg["engine"] = DEFAULTS["engine"]
     if cfg["translator"] not in TRANSLATORS.values():
         cfg["translator"] = DEFAULTS["translator"]
+    if cfg.get("target") not in dict(TARGETS).values():
+        cfg["target"] = "en"
     if saved and saved.get("asr_v", 1) < 2 and cfg["engine"] == "sensevoice":
         cfg["engine"] = "qwen3"  # one-time switch to the more accurate two-pass speech recognition
     cfg["asr_v"] = 2
@@ -332,6 +424,48 @@ def needs_translation(text, det, trust=False):
         return det != "en"
     words = re.findall(r"[A-Za-zÀ-ɏ']+", text)
     return len(words) >= 3 and not looks_english(text)
+
+
+_HAN = re.compile(r"[\u3400-\u9fff\uf900-\ufaff]")
+_KANA = re.compile(r"[\u3040-\u30ff]")
+_HANGUL = re.compile(r"[\uac00-\ud7af]")
+_SCRIPT_OF = {"ru": re.compile(r"[\u0400-\u04ff]"), "th": re.compile(r"[\u0e00-\u0e7f]")}
+
+
+def in_language(text, lang, target, trust=False):
+    """Is the line already in the caption language (so it's shown as it is, not translated)?
+    lang: what the line was recognised as. A few words of English mixed in don't change the answer."""
+    if target == "en":
+        return not needs_translation(text, lang, trust)
+    latin_words = len(re.findall(r"[A-Za-z\u00c0-\u024f']+", text))
+    if target in ("zh", "zh-Hant"):
+        if _KANA.search(text) or _HANGUL.search(text) or lang == "yue":
+            return False  # Japanese, Korean - or Cantonese, which Mandarin speakers get translated
+        han = len(_HAN.findall(text))
+        return han > 0 and han >= latin_words
+    if target == "ja":
+        kana, han = len(_KANA.findall(text)), len(_HAN.findall(text))
+        return (kana > 0 or (lang == "ja" and han > 0)) and not _HANGUL.search(text) and kana + han >= latin_words
+    if target == "ko":
+        hangul = len(_HANGUL.findall(text))
+        return hangul > 0 and hangul >= latin_words
+    if target in _SCRIPT_OF:
+        letters = len(_SCRIPT_OF[target].findall(text))
+        return letters > 0 and letters >= latin_words
+    # Latin-script caption languages (Spanish, French, Vietnamese...): only the recogniser can tell
+    non_latin = any(ch.isalpha() and ord(ch) > 0x24F and not 0x1E00 <= ord(ch) <= 0x1EFF for ch in text)
+    return not non_latin and lang == target
+
+
+def caption_target(text, lang, cfg, trust=False):
+    """The language this line should be captioned in, or None if it's fine as it is.
+    Both ways: lines already in the caption language get English captions instead."""
+    target = cfg.get("target") or "en"
+    if not in_language(text, lang, target, trust):
+        return target
+    if cfg.get("both_ways") and target != "en":
+        return "en"
+    return None
 
 
 def runaway_text(text):
@@ -1640,10 +1774,10 @@ def _unquote(text):
 
 
 def parse_translation(text, original):
-    """Returns (fixed_original, english). Handles 'ENGLISH:/FIXED:' replies and plain replies."""
+    """Returns (fixed_original, translation). Handles 'ENGLISH:/TRANSLATION:/FIXED:' replies and plain replies."""
     text = re.sub(r"<think>.*?</think>", "", text, flags=re.S).strip()
-    eng_m = re.search(r"ENGLISH:\s*(.*?)\s*(?=\n\s*FIXED:|$)", text, flags=re.S | re.I)
-    fix_m = re.search(r"FIXED:\s*(.*?)\s*(?=\n\s*ENGLISH:|$)", text, flags=re.S | re.I)
+    eng_m = re.search(r"(?:ENGLISH|TRANSLATION):\s*(.*?)\s*(?=\n\s*FIXED:|$)", text, flags=re.S | re.I)
+    fix_m = re.search(r"FIXED:\s*(.*?)\s*(?=\n\s*(?:ENGLISH|TRANSLATION):|$)", text, flags=re.S | re.I)
     if eng_m:
         eng = eng_m.group(1)
     elif fix_m:  # only a FIXED line came back
@@ -1659,11 +1793,11 @@ def parse_translation(text, original):
 
 
 def english_so_far(text):
-    """The English part of a reply that's still streaming in."""
+    """The translation part of a reply that's still streaming in."""
     text = re.sub(r"<think>.*?(</think>|$)", "", text, flags=re.S).lstrip()
-    if "ENGLISH:".startswith(text.upper()):  # the label itself is still arriving
-        return ""
-    text = re.sub(r"^ENGLISH:\s*", "", text, flags=re.I).lstrip("\"'“「")
+    if "ENGLISH:".startswith(text.upper()) or "TRANSLATION:".startswith(text.upper()):
+        return ""  # the label itself is still arriving
+    text = re.sub(r"^(?:ENGLISH|TRANSLATION):\s*", "", text, flags=re.I).lstrip("\"'“「")
     text = re.split(r"\n\s*F(?:I(?:X(?:E(?:D(?::)?)?)?)?)?\s*$|\n\s*FIXED:", text, flags=re.I)[0]
     return _unquote(text.strip().split("\n\n")[0]) if text.strip() else ""
 
@@ -1767,8 +1901,8 @@ class Translator(threading.Thread):
             log(traceback.format_exc())
             return self.error
 
-    def _messages(self, text, lang, context, fix, alt=None):
-        system = TRANSLATE_PROMPT
+    def _messages(self, text, lang, context, fix, alt=None, target="en"):
+        system = translation_prompt(target)
         topic = (self.cfg.get("topic") or "").strip()
         words = parse_words(self.cfg.get("words"))
         if topic:
@@ -1781,11 +1915,11 @@ class Translator(threading.Thread):
         user = f"Earlier lines:\n{ctx}\n\nNew line ({LANG_NAME.get(lang, lang)}{mixed}):\n{text}"
         if alt:
             user += f"\n\nA second speech recognizer heard the same line as:\n{alt}"
-        return [{"role": "system", "content": system + (FORMAT_FIX if fix else FORMAT_ENGLISH)},
+        return [{"role": "system", "content": system + reply_format(target, fix)},
                 {"role": "user", "content": user + "\n/no_think"}]
 
-    def translate_text(self, text, lang, context, on_english=None, fix=None, alt=None):
-        """Returns (fixed_original, english). on_english(text) gets the English as it streams in."""
+    def translate_text(self, text, lang, context, on_english=None, fix=None, alt=None, target="en"):
+        """Returns (fixed_original, translation into `target`). on_english(text) gets it as it streams in."""
         fix = (lang in FIX_LANGS) if fix is None else fix
         last = [""]
 
@@ -1795,41 +1929,42 @@ class Translator(threading.Thread):
                 last[0] = eng
                 on_english(eng)
 
-        reply = HOST.chat(self.cfg["translator"], self._messages(text, lang, context, fix, alt),
+        reply = HOST.chat(self.cfg["translator"], self._messages(text, lang, context, fix, alt, target),
                           max_tokens=250 if fix else 120, temperature=0.3, timeout=60,
                           on_text=stream if on_english else None)
         return parse_translation(reply, text)
 
-    def submit(self, line_id, text, lang, alt=None, fix=None):
-        """alt: how a second recognizer heard the line. fix: also ask for a corrected original."""
+    def submit(self, line_id, text, lang, alt=None, fix=None, target="en"):
+        """alt: how a second recognizer heard the line. fix: also ask for a corrected original.
+        target: the language to caption it in."""
         self.finished.append(line_id)
         with self.plock:
             if self.preview_slot and self.preview_slot[0] == line_id:
                 self.preview_slot = None
-        self.inbox.put((line_id, text, lang, alt, fix))
+        self.inbox.put((line_id, text, lang, alt, fix, target))
 
-    def preview(self, utt_id, text, lang):
+    def preview(self, utt_id, text, lang, target="en"):
         """Offer a still-being-spoken line for a quick early translation."""
         if not self.ready_model or utt_id in self.finished:
             return
         if len(text) - self.previewed.get(utt_id, 0) < 3:  # wait until it's grown a bit
             return
         with self.plock:
-            self.preview_slot = (utt_id, text, lang)
+            self.preview_slot = (utt_id, text, lang, target)
 
     def _do_preview(self):
         with self.plock:
             item, self.preview_slot = self.preview_slot, None
         if not item or not self.ready_model:
             return
-        utt_id, text, lang = item
+        utt_id, text, lang, target = item
         if utt_id in self.finished:
             return
         self.previewed[utt_id] = len(text)
         if len(self.previewed) > 50:
             self.previewed.pop(next(iter(self.previewed)))
         try:
-            _, eng = self.translate_text(text, lang, list(self.history), fix=False)
+            _, eng = self.translate_text(text, lang, list(self.history), fix=False, target=target)
             if eng and utt_id not in self.finished:
                 self.out.put(("live_eng", utt_id, eng))
         except Exception as e:
@@ -1838,7 +1973,7 @@ class Translator(threading.Thread):
     def run(self):
         while True:
             try:
-                line_id, text, lang, alt, fix = self.inbox.get(timeout=0.05)
+                line_id, text, lang, alt, fix, target = self.inbox.get(timeout=0.05)
             except queue.Empty:
                 self._do_preview()
                 continue
@@ -1850,7 +1985,7 @@ class Translator(threading.Thread):
                     continue
                 t0 = time.monotonic()
                 fixed, eng = self.translate_text(
-                    text, lang, list(self.history), fix=fix, alt=alt,
+                    text, lang, list(self.history), fix=fix, alt=alt, target=target,
                     on_english=lambda e: self.out.put(("translating", line_id, e)))
                 log(f"  -> {fixed} | {eng}  ({(time.monotonic() - t0) * 1000:.0f} ms)")
                 if eng:
@@ -1926,17 +2061,17 @@ class Listener(threading.Thread):
             return
         # Two-pass: show the quick version now if it looks like real speech, then let Qwen3-ASR
         # re-listen in the background and correct (or remove) it.
-        lang, need = self._classify(text, det)
+        lang, to = self._classify(text, det)
         if self.cfg.get("game_mode", True) and self.fast_pass_ok():
             if not text:  # SenseVoice heard no words: game sounds, not speech
                 self.out.put(("dropped", line_id))
                 return
-            if det == "en" and not need:  # plain English: SenseVoice is already reliable here
+            if det == "en" and to is None:  # plain English, captions in English: SenseVoice is reliable here
                 self._publish("final", line_id, text, det, spk, audio16)
                 return
-        shown = len(_PUNCT.sub("", text)) >= 3 and not (self.cfg.get("hide_english") and not need)
+        shown = len(_PUNCT.sub("", text)) >= 3 and not (self.cfg.get("hide_english") and to is None)
         if shown:
-            self.out.put(("final", line_id, text, lang, self._wants_english(need), spk, True))
+            self.out.put(("final", line_id, text, lang, self._wants_translation(to), spk, True))
         self.refine_q.put((line_id, audio16, text, det, spk, shown))
 
     def _trusted_language(self):
@@ -1945,18 +2080,21 @@ class Listener(threading.Thread):
         return lang if lang and lang not in SENSEVOICE_LANGS else None
 
     def _classify(self, text, det):
-        """(language label, does it need translating?) - judged from what was actually said."""
+        """(language label, language to caption it in - None if it's fine as it is),
+        judged from what was actually said."""
         if self.asr.kind == "whisper":
-            return det, needs_translation(text, det, trust=True)
+            return det, caption_target(text, det, self.cfg, trust=True)
         trusted = self._trusted_language()
         lang = text_language(text, trusted or det)
         if lang == "en" and needs_translation(text, "en"):
             lang = "other"  # Latin letters but not English (Spanish, French...) with no language picked
-        return lang, needs_translation(text, lang, trust=bool(trusted))
+        return lang, caption_target(text, lang, self.cfg, trust=bool(trusted))
 
-    def _wants_english(self, need):
-        can_translate = bool(self.translator.ready_model) or self.asr.kind == "whisper"
-        return need and self.cfg["show"] != "original" and can_translate
+    def _wants_translation(self, to):
+        if to is None or self.cfg["show"] == "original":
+            return False
+        # without the AI translator, Whisper can still translate - but only into English
+        return bool(self.translator.ready_model) or (self.asr.kind == "whisper" and to == "en")
 
     def _refine_loop(self):
         while not self.stop_evt.is_set():
@@ -1981,20 +2119,20 @@ class Listener(threading.Thread):
 
     def _publish(self, kind, line_id, text, det, spk, audio16, alt=None):
         whisper = self.asr.kind == "whisper"
-        lang, need = self._classify(text, det)
-        if self.cfg.get("hide_english") and not need:
+        lang, to = self._classify(text, det)
+        if self.cfg.get("hide_english") and to is None:
             self.out.put(("retract", line_id))
             return
-        needs_english = self._wants_english(need)
-        self.out.put((kind, line_id, text, lang, needs_english, spk, False))
+        wanted = self._wants_translation(to)
+        self.out.put((kind, line_id, text, lang, wanted, spk, False))
         log(f"[{lang}] (speaker {spk}) {text}")
-        if not needs_english:
+        if not wanted:
             return
         if self.translator.ready_model:
             differs = alt and _PUNCT.sub("", alt).lower() != _PUNCT.sub("", text).lower()
-            self.translator.submit(line_id, text, lang, alt=alt if differs else None,
+            self.translator.submit(line_id, text, lang, alt=alt if differs else None, target=to,
                                    fix=lang in FIX_LANGS and kind != "refined" and self.asr.kind == "sensevoice")
-        elif whisper:  # no AI translator: fall back to Whisper's own
+        elif whisper:  # no AI translator: fall back to Whisper's own (English only)
             eng = self.asr.translate(audio16, det)
             if eng:
                 self.out.put(("translated", line_id, eng, text))
@@ -2099,14 +2237,14 @@ class Listener(threading.Thread):
             last_run = now
             text, det = self.asr.transcribe(to16k([ch for ch, _ in chunks]), self.language(), False)
             if text:
-                lang, need = self._classify(text, det)
-                if self.cfg.get("hide_english") and not need:
-                    continue  # don't flash up English that's going to be hidden anyway
+                lang, to = self._classify(text, det)
+                if self.cfg.get("hide_english") and to is None:
+                    continue  # don't flash up a line that's going to be hidden anyway
                 if self.utt_id is None:
                     self.utt_id = next(_line_ids)
                 self.out.put(("partial", text, lang, self.utt_id))
-                if not self.cfg.get("game_mode", True) and self.cfg["show"] != "original" and need:
-                    self.translator.preview(self.utt_id, text, lang)
+                if not self.cfg.get("game_mode", True) and self.cfg["show"] != "original" and to:
+                    self.translator.preview(self.utt_id, text, lang, to)
 
 
 # --------------------------------------------------------------------------
@@ -2392,16 +2530,26 @@ class Overlay:
             eng_col = main
         marker = (spk, self._blend(voice, 0.4) if state == "old" else voice) if voice else None
 
-        if show == "original" or lang == "en" or (not needs and not eng):
+        to = self._script_of(eng)
+        if show == "original" or (not needs and not eng):
             self._label(orig, self._font(lang, True, scale), main, gap, marker)
         elif show == "english":
             if eng:
-                self._label(eng, self._font("en", True, scale), eng_col, gap, marker)
-            else:  # nothing in English yet: show what was said, small
+                self._label(eng, self._font(to, True, scale), eng_col, gap, marker)
+            else:  # no translation yet: show what was said, small
                 self._label(orig, self._font(lang, False, scale), sub, gap, marker)
         else:
             self._label(orig, self._font(lang, False, scale), sub, gap, marker)
-            self._label(eng or "…", self._font("en", True, scale), eng_col if eng else "#6a6a6a", 1)
+            self._label(eng or "…", self._font(to, True, scale), eng_col if eng else "#6a6a6a", 1)
+
+    def _script_of(self, text):
+        """Font language for a translation: English, or e.g. Chinese when captioning into Chinese."""
+        if not text:
+            return "en"
+        to = text_language(text, "en")
+        if to == "zh" and self.cfg.get("target") == "zh-Hant":
+            to = "yue"  # Traditional characters: Microsoft JhengHei
+        return to
 
     def _redraw(self):
         """Batch updates: at most ~8 redraws a second (streaming text can arrive every few ms)."""
@@ -2801,7 +2949,7 @@ def _runs_on(prev, line):
             and not a.endswith(_SENTENCE_END)
             and not re.match(r"\s*(\[[^\]]{1,24}\]|\S{1,24}[:：])", b)  # "[Team] name:" starts a new chat message
             and has_foreign_script(a) == has_foreign_script(b)
-            and not clearly_english(a) and not clearly_english(b))
+            and looks_english(a) == looks_english(b))  # never a foreign line + its English subtitle
 
 
 def group_lines(spots):
@@ -2819,10 +2967,12 @@ def group_lines(spots):
     return blocks
 
 
-def screen_needs_translation(text):
+def screen_needs_translation(text, target="en"):
     if not re.search(r"[^\W\d_]", text):  # no letters: numbers, times, scores, symbols
         return False
-    return not clearly_english(text)
+    if target == "en":
+        return not clearly_english(text)
+    return not in_language(text, "", target)
 
 
 def _same_text(a, b):
@@ -2833,7 +2983,7 @@ def _same_text(a, b):
 
 
 def translate_screen_text(texts, cfg, job, status=log):
-    prompt = SCREEN_TRANSLATE_PROMPT
+    prompt = screen_prompt(cfg.get("target") or "en")
     topic, words = (cfg.get("topic") or "").strip(), parse_words(cfg.get("words"))
     if topic:
         prompt += f"\nWhat's on screen: {topic}"
@@ -2852,7 +3002,8 @@ def read_screenshot(job, cfg, status=log):
     """Finds the text in job.image and translates whatever isn't English.
     Returns the text blocks; the ones that got an 'eng' are painted over."""
     blocks = group_lines(spot_text(job, status))
-    todo = [b for b in blocks if screen_needs_translation(b["text"])]
+    target = cfg.get("target") or "en"
+    todo = [b for b in blocks if screen_needs_translation(b["text"], target)]
     if todo:
         for b, eng in zip(todo, translate_screen_text([b["text"] for b in todo], cfg, job, status)):
             if eng and not _same_text(eng, b["text"]):
@@ -2864,9 +3015,11 @@ def read_screenshot(job, cfg, status=log):
 _FONTS = {}
 
 
-def paint_font(size, text=""):
-    """Font for the English painted onto screenshots (with a fallback for any non-Latin words in it)."""
-    if re.search(r"[가-힯]", text):
+def paint_font(size, text="", prefer=""):
+    """Font for the translation painted onto screenshots. prefer="zh-Hant": Traditional Chinese glyphs."""
+    if prefer == "zh-Hant" and _HAN.search(text) and not re.search(r"[가-힯぀-ヿ]", text):
+        kind, files = "hant", ["msjh.ttc", "msyh.ttc", "NotoSansCJK-Medium.ttc", "NotoSansCJK-Regular.ttc"]
+    elif re.search(r"[가-힯]", text):
         kind, files = "ko", ["malgun.ttf", "NotoSansCJK-Medium.ttc", "NotoSansCJK-Regular.ttc"]
     elif re.search(r"[぀-ヿ]", text):
         kind, files = "ja", ["YuGothM.ttc", "meiryo.ttc", "NotoSansCJK-Medium.ttc", "NotoSansCJK-Regular.ttc"]
@@ -2937,11 +3090,22 @@ def _box_colours(px, box):
     return tuple(int(v) for v in bg_top), tuple(int(v) for v in bg_bottom), tuple(int(v) for v in fg)
 
 
+_CJK_CHAR = "\u3040-\u30ff\u3400-\u9fff\uf900-\ufaff"
+_WRAP_PIECE = re.compile(f"[{_CJK_CHAR}][，。、！？；：」』）】》〉…,.!?;:)\\]]*|[^{_CJK_CHAR}]+")
+
+
+def _wrap_units(text):
+    """(piece, space before it). Chinese/Japanese can break between any two characters, other text only
+    at spaces; closing punctuation stays with the character before it."""
+    return [(piece, i > 0 and j == 0)
+            for i, word in enumerate(text.split()) for j, piece in enumerate(_WRAP_PIECE.findall(word))]
+
+
 def _wrap(draw, text, font, width, force=False):
     """Greedy word wrap; force=True also splits words too long for a line on their own."""
     lines, cur = [], ""
-    for word in text.split():
-        trial = f"{cur} {word}" if cur else word
+    for word, space in _wrap_units(text):
+        trial = (cur + (" " if space else "") + word) if cur else word
         if not cur or draw.textlength(trial, font=font) <= width:
             cur = trial
         else:
@@ -2958,7 +3122,7 @@ def _wrap(draw, text, font, width, force=False):
     return lines or [""]
 
 
-def _fit(draw, text, box, line_h, n_lines, centred, W, H):
+def _fit(draw, text, box, line_h, n_lines, centred, W, H, prefer=""):
     """The biggest readable font for the English in the box. Text may spill sideways a little (to the right,
     or both ways for centred text) rather than become tiny; if nothing fits, the box grows downward.
     Returns (font, size, lines, line height, painted box)."""
@@ -2970,7 +3134,7 @@ def _fit(draw, text, box, line_h, n_lines, centred, W, H):
     for grow in ((1.0, 1.35, 1.7) if n_lines == 1 else (1.0, 1.15)):
         width = min(W - 4, bw * grow)
         for size in range(s_hi, s_lo - 1, -1):
-            font = paint_font(size, text)
+            font = paint_font(size, text, prefer)
             lines = _wrap(draw, text, font, width)
             if (max(draw.textlength(ln, font=font) for ln in lines) <= width
                     and len(lines) * size * 1.2 <= bh * 1.08 + 2):
@@ -2983,9 +3147,9 @@ def _fit(draw, text, box, line_h, n_lines, centred, W, H):
         _, size, lines = best
     else:
         size = s_lo
-        lines = _wrap(draw, text, paint_font(size, text), min(W - 4, bw * (1.7 if n_lines == 1 else 1.0)),
+        lines = _wrap(draw, text, paint_font(size, text, prefer), min(W - 4, bw * (1.7 if n_lines == 1 else 1.0)),
                       force=True)
-    font, lh = paint_font(size, text), size * 1.2
+    font, lh = paint_font(size, text, prefer), size * 1.2
     need_w = max(draw.textlength(ln, font=font) for ln in lines) + 2 * max(2, size * 0.25)
     if need_w > bw:
         left = (x1 + x2) / 2 - need_w / 2 if centred else x1
@@ -2998,8 +3162,8 @@ def _fit(draw, text, box, line_h, n_lines, centred, W, H):
     return font, size, lines, lh, (x1, y1, x2, y2)
 
 
-def paint_translation(image, blocks):
-    """The screenshot with each translated block's English drawn over its original text, like Google Lens."""
+def paint_translation(image, blocks, target="en"):
+    """The screenshot with each translated block drawn over its original text, like Google Lens."""
     import numpy as np
     from PIL import Image, ImageDraw
 
@@ -3018,7 +3182,7 @@ def paint_translation(image, blocks):
         box = (max(0, x1 - pad), max(0, y1 - pad), min(W, x2 + pad), min(H, y2 + pad))
         top, bottom, fg = _box_colours(px, b["box"])
         centred = abs((x1 + x2) / 2 - W / 2) < W * 0.1  # subtitles, titles, dialog buttons
-        font, size, lines, lh, rect = _fit(draw, b["eng"], box, line_h, len(b["lines"]), centred, W, H)
+        font, size, lines, lh, rect = _fit(draw, b["eng"], box, line_h, len(b["lines"]), centred, W, H, target)
         todo.append((rect, top, bottom, fg, font, size, lines, lh, centred))
     # every background first, then all the text, so a box that grew never hides a neighbour's English
     for (x1, y1, x2, y2), top, bottom, *_ in todo:
@@ -3128,7 +3292,7 @@ class LensView:
         if self.english:
             self.root.clipboard_clear()
             self.root.clipboard_append(self.english)
-            self.set_hint("Copied the English  ·  click to close")
+            self.set_hint("Copied the translation  ·  click to close")
 
     def close(self):
         if self.is_open:
@@ -3404,7 +3568,12 @@ class HistoryWindow:
                                 font=(SCRIPT_FONTS.get(e.get("lang"), script_font(e["orig"])), 11))
                 t.insert("end", e["orig"] + "\n", (otag,) if e.get("eng") else (otag, "eng"))
             if e.get("eng"):
-                t.insert("end", e["eng"] + "\n", "eng")
+                tags = ("eng",)
+                if has_foreign_script(e["eng"]):  # e.g. captions translated into Chinese
+                    family = script_font(e["eng"])
+                    t.tag_configure(f"eng_{family}", font=(family, 12, "bold"))
+                    tags = ("eng", f"eng_{family}")
+                t.insert("end", e["eng"] + "\n", tags)
         q = self.search.get().strip()
         if q:
             start = "1.0"
@@ -3563,37 +3732,50 @@ class App:
         self.tr_cb.grid(row=4, column=1, sticky="ew")
         self.tr_cb.bind("<<ComboboxSelected>>", lambda e: self.translator_changed())
 
+        # Which language the captions are in
+        row(5, "Captions in")
+        cf = ttk.Frame(f)
+        cf.grid(row=5, column=1, sticky="ew")
+        cf.columnconfigure(0, weight=1)
+        self.target_cb = ttk.Combobox(cf, values=[n for n, _ in TARGETS], state="readonly")
+        self.target_cb.set(next((n for n, code in TARGETS if code == c["target"]), "English"))
+        self.target_cb.grid(row=0, column=0, sticky="ew")
+        self.target_cb.bind("<<ComboboxSelected>>", lambda e: self.target_changed())
+        self.both_var = tk.BooleanVar(value=c["both_ways"])
+        self.both_cb = ttk.Checkbutton(cf, variable=self.both_var, command=self.target_changed)
+        self.both_cb.grid(row=0, column=1, padx=(8, 0))
+
         # Help for the recognizer and translator
-        row(5, "Topic")
+        row(6, "Topic")
         self.topic_var = tk.StringVar(value=c["topic"])
         te = ttk.Entry(f, textvariable=self.topic_var)
-        te.grid(row=5, column=1, sticky="ew")
-        row(6, "Custom words")
+        te.grid(row=6, column=1, sticky="ew")
+        row(7, "Custom words")
         self.words_var = tk.StringVar(value=c["words"])
         we = ttk.Entry(f, textvariable=self.words_var)
-        we.grid(row=6, column=1, sticky="ew")
+        we.grid(row=7, column=1, sticky="ew")
         for ent in (te, we):
             ent.bind("<FocusOut>", lambda e: self.hints_changed())
             ent.bind("<Return>", lambda e: self.hints_changed())
 
         # Language
-        row(7, "Spoken language")
+        row(8, "Spoken language")
         self.lang_cb = ttk.Combobox(f, values=[n for n, _ in LANGUAGES], state="readonly")
         self.lang_cb.set(next((n for n, code in LANGUAGES if code == c["language"]), "Auto-detect"))
-        self.lang_cb.grid(row=7, column=1, sticky="ew")
+        self.lang_cb.grid(row=8, column=1, sticky="ew")
         self.lang_cb.bind("<<ComboboxSelected>>", lambda e: self.simple_changed())
 
         # Show mode
-        row(8, "Show")
+        row(9, "Show")
         self.show_cb = ttk.Combobox(f, values=list(SHOW_MODES), state="readonly")
-        self.show_cb.set({v: k for k, v in SHOW_MODES.items()}.get(c["show"], "Original + English"))
-        self.show_cb.grid(row=8, column=1, sticky="ew")
+        self.show_cb.set({v: k for k, v in SHOW_MODES.items()}.get(c["show"], "Original + translation"))
+        self.show_cb.grid(row=9, column=1, sticky="ew")
         self.show_cb.bind("<<ComboboxSelected>>", lambda e: self.simple_changed())
 
         # Which apps to listen to
-        row(9, "Listen to")
+        row(10, "Listen to")
         lf = ttk.Frame(f)
-        lf.grid(row=9, column=1, sticky="ew")
+        lf.grid(row=10, column=1, sticky="ew")
         lf.columnconfigure(0, weight=1)
         self.appmode_cb = ttk.Combobox(lf, values=list(APP_MODES), state="readonly")
         self.appmode_cb.set({v: k for k, v in APP_MODES.items()}.get(c["app_mode"], "All apps"))
@@ -3602,12 +3784,12 @@ class App:
         self.apps_btn = ttk.Button(lf, text="Apps...", command=self.pick_apps)
         self.apps_btn.grid(row=0, column=1, padx=(6, 0))
         self.apps_var = tk.StringVar()
-        ttk.Label(f, textvariable=self.apps_var, foreground="#777").grid(row=10, column=1, sticky="w")
+        ttk.Label(f, textvariable=self.apps_var, foreground="#777").grid(row=11, column=1, sticky="w")
 
         # Output device (for "All apps")
-        row(11, "Output device")
+        row(12, "Output device")
         af = ttk.Frame(f)
-        af.grid(row=11, column=1, sticky="ew")
+        af.grid(row=12, column=1, sticky="ew")
         af.columnconfigure(0, weight=1)
         self.audio_cb = ttk.Combobox(af, state="readonly")
         self.audio_cb.grid(row=0, column=0, sticky="ew")
@@ -3615,7 +3797,7 @@ class App:
         ttk.Button(af, text="↻", width=3, command=self.refresh_audio).grid(row=0, column=1, padx=(6, 0))
         self.refresh_audio()
 
-        ttk.Separator(f).grid(row=12, column=0, columnspan=2, sticky="ew", pady=10)
+        ttk.Separator(f).grid(row=13, column=0, columnspan=2, sticky="ew", pady=10)
 
         def slider(i, label, key, lo, hi, cast):
             row(i, label)
@@ -3624,35 +3806,35 @@ class App:
                       command=lambda v: self.look_changed(key, cast(float(v)))).grid(row=i, column=1, sticky="ew")
             return var
 
-        self.font_var = slider(13, "Text size", "font", 10, 48, int)
-        slider(14, "Background", "opacity", 0.0, 1.0, float)  # 0 = no box, just the text
-        slider(15, "Max width", "width", 0.25, 1.0, float)
-        slider(16, "Lines on screen", "history", 1, 4, lambda v: int(round(v)))
+        self.font_var = slider(14, "Text size", "font", 10, 48, int)
+        slider(15, "Background", "opacity", 0.0, 1.0, float)  # 0 = no box, just the text
+        slider(16, "Max width", "width", 0.25, 1.0, float)
+        slider(17, "Lines on screen", "history", 1, 4, lambda v: int(round(v)))
 
         self.spk_var = tk.BooleanVar(value=c["speakers"])
         ttk.Checkbutton(f, text="Label different speakers", variable=self.spk_var,
                         command=lambda: self.look_changed("speakers", self.spk_var.get())
-                        ).grid(row=17, column=0, columnspan=2, sticky="w", pady=(8, 0))
+                        ).grid(row=18, column=0, columnspan=2, sticky="w", pady=(8, 0))
         self.hide_en_var = tk.BooleanVar(value=c["hide_english"])
-        ttk.Checkbutton(f, text="Hide lines that are already in English", variable=self.hide_en_var,
+        ttk.Checkbutton(f, text="Hide lines that don't need translating", variable=self.hide_en_var,
                         command=lambda: self.look_changed("hide_english", self.hide_en_var.get())
-                        ).grid(row=18, column=0, columnspan=2, sticky="w")
+                        ).grid(row=19, column=0, columnspan=2, sticky="w")
 
         self.click_var = tk.BooleanVar(value=c["click_through"])
         ttk.Checkbutton(f, text=f"Lock captions in place   ({HOTKEY_LOCK_LABEL})", variable=self.click_var,
                         command=lambda: self.set_locked(self.click_var.get())
-                        ).grid(row=19, column=0, columnspan=2, sticky="w")
+                        ).grid(row=20, column=0, columnspan=2, sticky="w")
         self.overlay.on_lock = self.set_locked
         self.game_var = tk.BooleanVar(value=c["game_mode"])
         ttk.Checkbutton(f, text="Game mode (smoother games - captions appear when each line ends)",
                         variable=self.game_var, command=self.game_mode_changed
-                        ).grid(row=20, column=0, columnspan=2, sticky="w")
+                        ).grid(row=21, column=0, columnspan=2, sticky="w")
         self.auto_var = tk.BooleanVar(value=c["autostart"])
         ttk.Checkbutton(f, text="Start subtitles when the app opens", variable=self.auto_var,
-                        command=self.simple_changed).grid(row=21, column=0, columnspan=2, sticky="w")
+                        command=self.simple_changed).grid(row=22, column=0, columnspan=2, sticky="w")
 
         bf = ttk.Frame(f)
-        bf.grid(row=22, column=0, columnspan=2, sticky="ew", pady=(14, 0))
+        bf.grid(row=23, column=0, columnspan=2, sticky="ew", pady=(14, 0))
         bf.columnconfigure((0, 1, 2), weight=1)
         self.start_btn = ttk.Button(bf, text="Start subtitles", command=self.toggle_listen)
         self.start_btn.grid(row=0, column=0, sticky="ew")
@@ -3668,9 +3850,23 @@ class App:
                   foreground="#888").grid(row=3, column=0, columnspan=3, pady=(4, 0))
 
         ttk.Label(f, text="Drag the box to move it · scroll on it to resize text · right-click for options",
-                  foreground="#888").grid(row=23, column=0, columnspan=2, pady=(10, 0))
+                  foreground="#888").grid(row=24, column=0, columnspan=2, pady=(10, 0))
         self._sync_device_box()
         self._sync_app_widgets()
+        self._sync_target_widgets()
+
+    def _sync_target_widgets(self):
+        target = self.cfg.get("target") or "en"
+        if target == "en":
+            self.both_cb.config(text="Both ways", state="disabled")
+        else:  # e.g. English speech -> Chinese captions, and Chinese speech -> English captions
+            self.both_cb.config(text=f"Both ways ({TARGET_SHORT[target]} → English)", state="normal")
+
+    def target_changed(self):
+        self.cfg["target"] = dict(TARGETS)[self.target_cb.get()]
+        self.cfg["both_ways"] = bool(self.both_var.get())
+        save_settings(self.cfg)
+        self._sync_target_widgets()  # new lines use it straight away
 
     def _sync_device_box(self):
         self.dev_cb.config(state="readonly")  # every speech model can run on the GPU now
@@ -3784,7 +3980,7 @@ class App:
                 t0 = time.monotonic()
                 blocks = read_screenshot(job, self.cfg, status=lambda m: self.q.put(("screen_status", job, m)))
                 done = [b for b in blocks if b.get("eng")]
-                picture = paint_translation(image, blocks) if done else None
+                picture = paint_translation(image, blocks, self.cfg.get("target") or "en") if done else None
                 log(f"Screenshot: {len(blocks)} text blocks, {len(done)} translated "
                     f"({time.monotonic() - t0:.1f}s)")
                 self.q.put(("screen_result", job, blocks, picture, None))
@@ -3816,14 +4012,15 @@ class App:
         done = [b for b in blocks if b.get("eng")]
         if not done:
             self.lens.close()
-            self.toast.show("Nothing to translate - it's all English already" if blocks else "No text found", 3)
+            short = TARGET_SHORT.get(self.cfg.get("target") or "en", "English")
+            self.toast.show(f"Nothing to translate - it's all {short} already" if blocks else "No text found", 3)
             return
         english = "\n".join(b["eng"] for b in done)
         self.history.screenshot("\n".join(b["text"] for b in done), english)
         self.toast.hide()
         if job.full:
             hint = (f"{len(done)} translated  ·  click, Esc or {HOTKEY_FULL_LABEL} to close  ·  "
-                    "right-click to copy the English")
+                    "right-click to copy the translation")
         else:
             hint = "Click or Esc to close  ·  right-click copies"
         self.lens.show(picture, job.origin, job.full, hint, english)

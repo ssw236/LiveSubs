@@ -1,6 +1,6 @@
 # LiveSubs
 
-Real-time subtitles and English translation for anything your PC plays: games, streams, videos, voice chat.
+Real-time subtitles and translation for anything your PC plays: games, streams, videos, voice chat.
 Everything runs locally on your own PC. Nothing you hear is sent to an online service.
 
 It's built for mixed-language speech (Mandarin with English, for example), noisy game audio, and playing
@@ -8,8 +8,11 @@ fullscreen games while it runs.
 
 ## Features
 
-- **Live captions over any app.** The original speech and its English translation appear in a small box that
+- **Live captions over any app.** The original speech and its translation appear in a small box that
   stays on top of games and videos without stealing focus.
+- **Captions in your language.** English by default, or Chinese (Simplified or Traditional), Korean,
+  Japanese, Spanish and more. *Both ways* translates in both directions at once, e.g. English speech into
+  Chinese and Chinese speech into English.
 - **Two-pass speech recognition.** SenseVoice gives an instant first version of each line, then Qwen3-ASR
   listens again and corrects it. This is especially good for mixed Mandarin/English and background noise.
 - **Natural translation.** Qwen3 14B, running on your GPU, translates for meaning: slang, tone and swearing
@@ -68,6 +71,15 @@ belong to one sentence (a wrapped paragraph or a two-line subtitle) are translat
 - **Copy the English:** right-click it.
 - Every translated screenshot is saved in the history.
 
+## Captions in other languages
+
+Pick the language under **Captions in**. Speech in any other language is translated into it; speech that's
+already in it is shown as it is (tick *Hide lines that don't need translating* to leave those out).
+
+Tick **Both ways** to translate in both directions: with captions in Chinese, English speech gets Chinese
+captions and Chinese speech gets English captions. That suits a mixed lobby or watching with someone who
+reads the other language. Screenshot translation uses the same caption language.
+
 ## Tips for better accuracy
 
 - **Topic:** describe what you're watching, e.g. *"Valorant ranked, Chinese and English teammates"*.
@@ -108,7 +120,7 @@ speakers / chosen apps (WASAPI loopback)
   → Silero VAD: is someone talking?
   → SenseVoice: instant first version of the line      (not used in Game mode)
   → Qwen3-ASR via llama.cpp (GPU): careful listen      (CPU version if there's no GPU)
-  → Qwen3 14B via llama.cpp (GPU): natural English
+  → Qwen3 14B via llama.cpp (GPU): natural translation (English or your caption language)
   → caption box + history
 ```
 
