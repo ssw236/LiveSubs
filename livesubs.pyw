@@ -51,6 +51,7 @@ from scipy.signal import resample_poly  # noqa: E402
 
 WHISPER_SR = 16000
 BG = "#101010"
+TEXT_KEY = "#0f0f0f"  # text-layer background that Windows makes see-through (close to BG so letter edges blend in)
 DEFAULT_AUDIO = "Default speakers"
 
 ENGINES = {
@@ -1947,6 +1948,7 @@ def _user32():
         u.GetForegroundWindow.restype = wintypes.HWND
         u.SetForegroundWindow.argtypes = [wintypes.HWND]
         u.IsWindow.argtypes = [wintypes.HWND]
+        u.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
         _U32 = u
     return _U32
 
@@ -1959,15 +1961,33 @@ def _hwnd(win):
 SWP_FLAGS = 0x0001 | 0x0002 | 0x0010 | 0x0200  # NOSIZE | NOMOVE | NOACTIVATE | NOOWNERZORDER
 
 
-def keep_on_top(win):
-    """Put a window above everything WITHOUT activating it (Tk's -topmost activates it)."""
+def keep_on_top(*wins):
+    """Put windows above everything WITHOUT activating them (Tk's -topmost activates).
+    With several windows, the last one ends up on top."""
+    for win in wins:
+        if sys.platform != "win32":
+            win.attributes("-topmost", True)
+            win.lift()
+            continue
+        try:
+            _user32().SetWindowPos(_hwnd(win), -1, 0, 0, 0, 0, SWP_FLAGS)  # -1 = HWND_TOPMOST
+        except Exception as e:
+            log("keep_on_top failed:", e)
+
+
+SW_HIDE, SW_SHOWNOACTIVATE = 0, 4
+
+
+def show_window(win, visible):
+    """Show or hide a window without activating it (Tk's deiconify would pull focus from the game).
+    A hidden window costs nothing; one that's merely transparent still makes Windows blend it over the game."""
     if sys.platform != "win32":
-        win.attributes("-topmost", True)
+        (win.deiconify if visible else win.withdraw)()
         return
     try:
-        _user32().SetWindowPos(_hwnd(win), -1, 0, 0, 0, 0, SWP_FLAGS)  # -1 = HWND_TOPMOST
+        _user32().ShowWindow(_hwnd(win), SW_SHOWNOACTIVATE if visible else SW_HIDE)
     except Exception as e:
-        log("keep_on_top failed:", e)
+        log("ShowWindow failed:", e)
 
 
 def game_safe(win, click_through=False):
@@ -2015,11 +2035,25 @@ class Overlay:
 
         self.tk = tk
         self.cfg, self.on_change = cfg, on_change
+        # Two layers, so the Background slider fades only the box and never the text:
+        #   back - the dark box; the slider sets how see-through it is
+        #   win  - the text, always fully solid; its own background colour is made see-through
+        self.back = b = tk.Toplevel(root)
+        b.overrideredirect(True)
+        b.configure(bg=BG)
         self.win = w = tk.Toplevel(root)
         w.overrideredirect(True)
-        w.configure(bg=BG)
-        self.body = tk.Frame(w, bg=BG)
+        self.text_bg = BG
+        if sys.platform == "win32":
+            try:
+                w.attributes("-transparentcolor", TEXT_KEY)
+                self.text_bg = TEXT_KEY
+            except Exception as e:
+                log("See-through text layer unavailable:", e)
+        w.configure(bg=self.text_bg)
+        self.body = tk.Frame(w, bg=self.text_bg)
         self.body.pack(fill="both", padx=12, pady=(4, 6))
+        self.shown = None  # are the layers on screen right now
 
         self.faded = self.user_hidden = False
         self.last_activity = self._last_top = time.monotonic()
@@ -2035,6 +2069,7 @@ class Overlay:
         self.menu.add_command(label="Reset position", command=self.reset_position)
         self.on_lock = lambda locked: None  # set by the App
         self._bind(w)
+        self._bind(b)  # clicks on the box (between the letters) land on the back layer
 
         self.apply()
         self.status("Starting...")
@@ -2064,7 +2099,7 @@ class Overlay:
     def apply(self):
         c = self.cfg
         self.w = int(self.win.winfo_screenwidth() * c["width"])
-        self._set_alpha(0.0 if self.faded else c["opacity"])
+        self._update_layers()
         self._redraw()
 
     def _font(self, lang, big, scale=1.0):
@@ -2072,21 +2107,37 @@ class Overlay:
         family = SCRIPT_FONTS.get(lang, "Segoe UI")
         return (family, size, "bold") if big else (family, max(9, int(size * 0.72)))
 
-    def _set_alpha(self, a):
-        # hidden (alpha 0) also means click-through, so an invisible box never blocks clicks
-        hidden = a <= 0 or self.user_hidden
-        self.win.attributes("-alpha", 0.0 if self.user_hidden else a)
-        game_safe(self.win, click_through=self.cfg["click_through"] or hidden)
+    def _update_layers(self):
+        """Box see-through as set by the slider, text always solid. Both are taken off screen
+        completely while nobody's talking or when hidden, so nothing sits over the game."""
+        opacity = max(0.0, min(1.0, float(self.cfg["opacity"])))
+        visible = not (self.faded or self.user_hidden)
+        self.back.attributes("-alpha", opacity)
+        locked = self.cfg["click_through"]
+        game_safe(self.back, click_through=locked)
+        game_safe(self.win, click_through=locked)
+        show_window(self.back, visible and opacity > 0.02)
+        show_window(self.win, visible)
+        if visible and not self.shown:
+            keep_on_top(self.back, self.win)
+        self.shown = visible
+
+    def hide_now(self):
+        """Take both layers off screen right away (e.g. so they're not in a screenshot)."""
+        show_window(self.back, False)
+        show_window(self.win, False)
+        self.shown = False
 
     def layout(self):
         """Box hugs the text (up to the max width) and stays anchored at its bottom-centre point."""
         self.win.update_idletasks()
         h = self.win.winfo_reqheight()
         w = min(self.w, max(120, self.win.winfo_reqwidth()))
-        self.win.geometry(f"{w}x{h}+{self.cx - w // 2}+{self.bottom - h}")
+        geometry = f"{w}x{h}+{self.cx - w // 2}+{self.bottom - h}"
+        self.win.geometry(geometry)
+        self.back.geometry(geometry)
 
     def set_visible(self, visible):
-        # Hidden = fully transparent. (Withdraw/deiconify would make Windows activate the box.)
         self.user_hidden = not visible
         self.apply()
 
@@ -2094,18 +2145,18 @@ class Overlay:
     def _label(self, text, font, color, top_pad, marker=None):
         """marker: (speaker number, colour) shown as a coloured tag before the text."""
         if marker is None:
-            lbl = self.tk.Label(self.body, text=text, font=font, fg=color, bg=BG, justify="center",
+            lbl = self.tk.Label(self.body, text=text, font=font, fg=color, bg=self.text_bg, justify="center",
                                 wraplength=self.w - 24)
             lbl.pack(fill="x", pady=(top_pad, 0))
             self._bind(lbl)
             return
-        row = self.tk.Frame(self.body, bg=BG)
+        row = self.tk.Frame(self.body, bg=self.text_bg)
         row.pack(pady=(top_pad, 0))
         num, mcol = marker
         tag = self.tk.Label(row, text=f"▍{num + 1}", font=("Segoe UI", max(9, int(font[1] * 0.75)), "bold"),
-                            fg=mcol, bg=BG)
+                            fg=mcol, bg=self.text_bg)
         tag.pack(side="left", anchor="n", padx=(0, 6))
-        lbl = self.tk.Label(row, text=text, font=font, fg=color, bg=BG, justify="left",
+        lbl = self.tk.Label(row, text=text, font=font, fg=color, bg=self.text_bg, justify="left",
                             wraplength=self.w - 90)
         lbl.pack(side="left")
         for wdg in (row, tag, lbl):
@@ -2277,17 +2328,17 @@ class Overlay:
         self.last_activity = time.monotonic()
         if self.faded:
             self.faded = False
-            self._set_alpha(self.cfg["opacity"])
+            self._update_layers()
 
     def tick(self, listening):
         now = time.monotonic()
         hold = self.cfg["hold"]
         if listening and not self.faded and hold > 0 and now - self.last_activity > hold:
             self.faded = True
-            self._set_alpha(0.0)  # fade out when nobody's talking
-        if not self.user_hidden and now - self._last_top > 2:
+            self._update_layers()  # nobody's talking: take the captions off screen
+        if self.shown and now - self._last_top > 2:
             self._last_top = now
-            keep_on_top(self.win)  # stay above games/videos without stealing focus
+            keep_on_top(self.back, self.win)  # stay above games/videos without stealing focus
 
     # ---- mouse ----
     def flash(self, text, color="#9ad0ff"):
@@ -2974,7 +3025,7 @@ class App:
             return var
 
         self.font_var = slider(13, "Text size", "font", 10, 48, int)
-        slider(14, "Background", "opacity", 0.3, 1.0, float)
+        slider(14, "Background", "opacity", 0.0, 1.0, float)  # 0 = no box, just the text
         slider(15, "Max width", "width", 0.25, 1.0, float)
         slider(16, "Lines on screen", "history", 1, 4, lambda v: int(round(v)))
 
@@ -3145,7 +3196,7 @@ class App:
 
     def _hide_for_shot(self):
         """Make our own windows invisible for a moment so they're not in the screenshot."""
-        self.overlay.win.attributes("-alpha", 0.0)
+        self.overlay.hide_now()
         for p in getattr(self, "popups", []):
             p.close()
         self.root.update()
