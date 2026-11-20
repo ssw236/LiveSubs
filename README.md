@@ -20,8 +20,9 @@ fullscreen games while it runs.
 - **Voice detection.** Game sounds and music aren't mistaken for speech, and lines end at real pauses.
 - **Speaker colours.** Different voices get their own colour and number.
 - **Per-app audio.** Listen to everything, everything except some apps (e.g. Spotify), or only chosen apps.
-- **Screenshot translation.** Press a hotkey and the screenshot comes back with English painted over the
-  foreign text, right where it was (like Google Lens). Works on menus, chat, signs and video subtitles.
+- **Screenshot translation.** Press a hotkey and the screenshot comes back with the translation painted over
+  the foreign text, right where it was (like Google Lens), usually in a second or two. Works on menus,
+  chat, signs and video subtitles.
 - **History.** A searchable, timestamped log of every translated line, saved as plain text.
 - **Game mode.** Speech recognition moves onto the graphics card, so the CPU is left to the game (see below).
 - **Topic and custom words.** Tell it what you're watching and which names or terms to expect.
@@ -64,12 +65,16 @@ The **Background** slider fades only the box behind the text; set it to 0 for te
 ## Translating text on screen
 
 Press `Ctrl+Alt+Y` for the whole screen, or `Ctrl+Alt+T` and drag a box around some text. The screenshot
-appears where it was taken, with English painted over every line that wasn't English already. Lines that
+appears where it was taken, with the translation painted over every line that needed one. Lines that
 belong to one sentence (a wrapped paragraph or a two-line subtitle) are translated together.
+
+It's quick because nothing is loaded for it: a small text reader (PaddleOCR) finds the text on the CPU in
+about half a second, and the translator that's already running for captions translates it. If the text
+reader isn't available, Qwen3-VL reads the screenshot instead, which takes longer.
 
 - **Close it:** click it, press `Esc`, or press the same hotkey again (this also cancels one that's still
   being read).
-- **Copy the English:** right-click it.
+- **Copy the translation:** right-click it.
 - Every translated screenshot is saved in the history.
 
 ## Captions in other languages
@@ -100,8 +105,7 @@ reads the other language. Screenshot translation uses the same caption language.
 - Use **Windowed Fullscreen** (borderless) in the game.
 - Cap the game's frame rate a little below what your PC can reach (in Valorant: *Limit FPS Always*).
   The headroom keeps frame times steady while LiveSubs translates.
-- The screenshot hotkeys swap AI models in video memory, which takes a few seconds of heavy GPU work,
-  so avoid them mid-fight.
+- Screenshot translation takes a second or two of CPU and GPU work, so it's best between fights.
 
 ## Files it creates
 
@@ -112,7 +116,7 @@ These stay on your PC and are excluded from git by `.gitignore`:
 | `models/` | Downloaded AI models and the llama.cpp engine |
 | `history/` | Your chat logs (`.txt` to read, `.jsonl` for the app) |
 | `settings.json` | Your settings |
-| `livesubs.log`, `ai-engine.log` | Logs for troubleshooting |
+| `livesubs.log`, `ai-engine.log`, `text-reader.log` | Logs for troubleshooting |
 
 ## How it works
 
@@ -125,7 +129,8 @@ speakers / chosen apps (WASAPI loopback)
   → caption box + history
 ```
 
-Screenshot translation uses Qwen3-VL 8B. Speaker colours use a 3D-Speaker voice-fingerprint model.
+Screenshot translation reads text with PaddleOCR (through RapidOCR) and translates it with the caption
+translator; Qwen3-VL 8B is the fallback reader. Speaker colours use a 3D-Speaker voice-fingerprint model.
 
 ## Built with
 
@@ -135,6 +140,7 @@ Screenshot translation uses Qwen3-VL 8B. Speaker colours use a 3D-Speaker voice-
 - [llama.cpp](https://github.com/ggml-org/llama.cpp) with [Qwen3](https://huggingface.co/Qwen/Qwen3-14B-GGUF),
   [Qwen3-VL](https://huggingface.co/Qwen/Qwen3-VL-8B-Instruct-GGUF) and
   [Qwen3-ASR](https://huggingface.co/ggml-org/Qwen3-ASR-0.6B-GGUF)
+- [RapidOCR](https://github.com/RapidAI/RapidOCR) with [PaddleOCR](https://github.com/PaddlePaddle/PaddleOCR) models
 - [faster-whisper](https://github.com/SYSTRAN/faster-whisper), [PyAudioWPatch](https://github.com/s0d3s/PyAudioWPatch),
   [pycaw](https://github.com/AndreMiras/pycaw)
 

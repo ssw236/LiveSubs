@@ -8,3 +8,5 @@ pillow
 numpy
 scipy
 truststore
+rapidocr>=3.10
+onnxruntime

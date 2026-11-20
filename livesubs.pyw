@@ -3014,7 +3014,219 @@ def _same_text(a, b):
     return norm(a) == norm(b)
 
 
-def translate_screen_text(texts, cfg, job, status=log):
+# ---- fast text reader: PaddleOCR models (via RapidOCR) on the CPU, in a helper process ----
+OCR_LOG = os.path.join(APP_DIR, "text-reader.log")
+_HANGUL_RE = re.compile(r"[\uac00-\ud7af]")
+
+
+def _ink_width(text):
+    """Roughly how many character-heights wide a line of text is."""
+    w = 0.0
+    for ch in text:
+        if re.match(r"[\u1100-\u11ff\u2e80-\u9fff\uac00-\ud7af\uf900-\ufaff\uff00-\uffef]", ch):
+            w += 1.0
+        elif ch.isspace() or ch in ".,:;!?'\"|[](){}-":
+            w += 0.3
+        else:
+            w += 0.55
+    return w
+
+
+def _ocr_lines(engine, korean, img):
+    """[[x1, y1, x2, y2, text, score], ...] for every line of text in an RGB array."""
+    res = engine(img)
+    out = []
+    boxes = res.boxes if res.boxes is not None else []
+    for box, text, score in zip(boxes, res.txts or (), res.scores or ()):
+        xs, ys = [float(p[0]) for p in box], [float(p[1]) for p in box]
+        x1, y1, x2, y2 = min(xs), min(ys), max(xs), max(ys)
+        text, score = " ".join(str(text).split()), float(score)
+        # letters the main model doesn't know (Hangul) come back missing: far too little text for the box
+        short = _ink_width(text) * max(1.0, y2 - y1) < 0.5 * (x2 - x1)
+        if korean is not None and (score < 0.6 or short):
+            crop = img[max(0, int(y1) - 2):int(y2) + 2, max(0, int(x1) - 2):int(x2) + 2]
+            try:
+                r = korean(crop, use_det=False, use_cls=False, use_rec=True)
+            except Exception as e:
+                print("Korean text reader failed:", e, file=sys.stderr, flush=True)
+                r, korean = None, None
+            if r is not None and r.txts:
+                ktext, kscore = " ".join(str(r.txts[0]).split()), float(r.scores[0])
+                if _HANGUL_RE.search(ktext) and kscore >= 0.5 and (kscore > score or short):
+                    text, score = ktext, kscore
+        if text and score >= 0.5:
+            out.append([round(x1), round(y1), round(x2), round(y2), text, round(score, 3)])
+    return out
+
+
+def ocr_server():
+    """--ocr-server: reads text off screenshots for the app (one JSON request per line on stdin). It's a
+    separate process so its ONNX runtime never meets the copy the speech models use."""
+    replies = os.fdopen(os.dup(sys.stdout.fileno()), "w", encoding="utf-8", buffering=1)
+    sys.stdout = sys.stderr  # whatever the libraries print goes to the log, not into the replies
+
+    def send(obj):
+        replies.write(json.dumps(obj, ensure_ascii=True) + "\n")
+        replies.flush()
+
+    try:
+        from rapidocr import LangRec, ModelType, OCRVersion, RapidOCR
+
+        base = {"Global.log_level": "error", "Global.text_score": 0.0, "Global.max_side_len": 4096,
+                "Det.limit_type": "max", "Det.limit_side_len": 2560,  # only ever shrink (4K screens)
+                "EngineConfig.onnxruntime.intra_op_num_threads": max(1, min(4, (os.cpu_count() or 4) // 2)),
+                "EngineConfig.onnxruntime.inter_op_num_threads": 1}
+        engine = RapidOCR(params=base)  # Chinese, English, Japanese and Latin-script languages
+    except Exception as e:
+        send({"ready": False, "error": f"{type(e).__name__}: {e}"})
+        return
+    korean = {}
+
+    def load_korean():  # Hangul needs its own small model, downloaded once by RapidOCR
+        try:
+            reader = RapidOCR(params=dict(base, **{
+                "Rec.lang_type": LangRec.KOREAN, "Rec.ocr_version": OCRVersion.PPOCRV5,
+                "Rec.model_type": ModelType.MOBILE}))
+            reader(np.full((48, 160, 3), 255, np.uint8), use_det=False, use_cls=False, use_rec=True)  # loads it
+            korean["engine"] = reader
+        except Exception as e:
+            korean["error"] = f"{type(e).__name__}: {e}"
+            print("Korean text reader unavailable:", korean["error"], file=sys.stderr, flush=True)
+
+    loader = threading.Thread(target=load_korean, daemon=True)
+    loader.start()
+    send({"ready": True})
+    for line in sys.stdin:
+        try:
+            req = json.loads(line)
+        except ValueError:
+            continue
+        if req.get("cmd") == "quit":
+            break
+        if req.get("cmd") == "prepare":
+            loader.join(timeout=600)
+            send({"id": req.get("id"), "korean": "engine" in korean, "korean_error": korean.get("error")})
+            continue
+        try:
+            t0 = time.monotonic()
+            lines = _ocr_lines(engine, korean.get("engine"), np.load(req["path"]))
+            send({"id": req.get("id"), "lines": lines, "ms": int((time.monotonic() - t0) * 1000)})
+        except Exception as e:
+            send({"id": req.get("id"), "error": f"{type(e).__name__}: {e}"})
+
+
+class TextReader:
+    """Reads text off screenshots in a helper process, on the CPU - about half a second, and nothing has to
+    be swapped into video memory: the translating is then done by the model already loaded for captions."""
+
+    def __init__(self):
+        self.proc = None
+        self.replies = queue.Queue()
+        self.lock = threading.Lock()
+        self.n = 0
+
+    @staticmethod
+    def installed():
+        import importlib.util
+
+        try:
+            return all(importlib.util.find_spec(m) for m in ("rapidocr", "onnxruntime"))
+        except Exception:
+            return False
+
+    def _pump(self, pipe, out):
+        for raw in iter(pipe.readline, b""):
+            out.put(raw)
+        out.put(None)
+
+    def _get(self, timeout):
+        while True:
+            raw = self.replies.get(timeout=timeout)
+            if raw is None:
+                self.proc = None
+                raise RuntimeError("the text reader stopped (details in text-reader.log)")
+            try:
+                return json.loads(raw)
+            except ValueError:
+                continue  # not one of its replies
+
+    def _start(self):
+        if self.proc is not None and self.proc.poll() is None:
+            return
+        exe = sys.executable
+        console = os.path.join(os.path.dirname(exe), "python.exe")
+        if os.path.basename(exe).lower() == "pythonw.exe" and os.path.exists(console):
+            exe = console  # pipes are dependable with the console Python (no window is shown)
+        err = open(OCR_LOG, "a", encoding="utf-8", errors="replace")
+        self.replies = queue.Queue()
+        self.proc = subprocess.Popen([exe, os.path.abspath(__file__), "--ocr-server"], cwd=APP_DIR,
+                                     stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=err,
+                                     creationflags=0x08000000 if sys.platform == "win32" else 0)
+        err.close()
+        _kill_with_us(self.proc)
+        threading.Thread(target=self._pump, args=(self.proc.stdout, self.replies), daemon=True).start()
+        hello = self._get(timeout=180)
+        if not hello.get("ready"):
+            self.stop()
+            raise RuntimeError(hello.get("error") or "the text reader didn't start")
+
+    def start(self):
+        with self.lock:
+            self._start()
+
+    def request(self, payload, timeout=60):
+        with self.lock:
+            self._start()
+            self.n += 1
+            payload = dict(payload, id=self.n)
+            self.proc.stdin.write((json.dumps(payload) + "\n").encode())
+            self.proc.stdin.flush()
+            while True:
+                msg = self._get(timeout)
+                if msg.get("id") == payload["id"]:
+                    break
+        if msg.get("error"):
+            raise RuntimeError(msg["error"])
+        return msg
+
+    def read(self, image):
+        """[{'box': (x1, y1, x2, y2), 'text': str}] for every line of text in a PIL image."""
+        import tempfile
+
+        path = os.path.join(tempfile.gettempdir(), f"livesubs-screenshot-{os.getpid()}.npy")
+        np.save(path, np.asarray(image.convert("RGB")))
+        try:
+            msg = self.request({"path": path})
+        finally:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+        log(f"Text reader: {len(msg['lines'])} lines in {msg.get('ms')} ms")
+        return [{"box": tuple(ln[:4]), "text": ln[4]} for ln in msg["lines"]]
+
+    def stop(self):
+        proc, self.proc = self.proc, None
+        if proc is not None and proc.poll() is None:
+            try:
+                proc.stdin.write(b'{"cmd": "quit"}\n')
+                proc.stdin.flush()
+                proc.wait(timeout=3)
+            except Exception:
+                proc.kill()
+
+
+TEXT_READER = TextReader()
+
+
+def loaded_model(cfg):
+    """The AI model already on the GPU (so screenshot text is translated without swapping anything in)."""
+    if HOST.running():
+        return HOST.key
+    return cfg["translator"] if cfg["translator"] != "off" else VISION_MODEL
+
+
+def translate_screen_text(texts, cfg, job, status=log, model=VISION_MODEL):
     prompt = screen_prompt(cfg.get("target") or "en")
     topic, words = (cfg.get("topic") or "").strip(), parse_words(cfg.get("words"))
     if topic:
@@ -3023,7 +3235,7 @@ def translate_screen_text(texts, cfg, job, status=log):
         prompt += "\nNames and terms that may appear: " + ", ".join(words)
     items = "\n".join(f"{i}. {' '.join(t.split())}" for i, t in enumerate(texts, 1))
     status(f"Translating {len(texts)} line{'' if len(texts) == 1 else 's'}...")
-    reply = HOST.chat(VISION_MODEL, [{"role": "system", "content": prompt}, {"role": "user", "content": items}],
+    reply = HOST.chat(model, [{"role": "system", "content": prompt}, {"role": "user", "content": items}],
                       max_tokens=min(3000, 100 + 80 * len(texts)), temperature=0.2, timeout=180,
                       status=status, on_text=job.check)
     job.check()
@@ -3031,13 +3243,25 @@ def translate_screen_text(texts, cfg, job, status=log):
 
 
 def read_screenshot(job, cfg, status=log):
-    """Finds the text in job.image and translates whatever isn't English.
-    Returns the text blocks; the ones that got an 'eng' are painted over."""
-    blocks = group_lines(spot_text(job, status))
+    """Finds the text in job.image and translates whatever isn't in the caption language.
+    Returns the text blocks; the ones that got an 'eng' (translation) are painted over.
+    Fast way: the text reader finds the text and the model already loaded for captions translates it.
+    Fallback: Qwen3-VL reads the text (swapped into video memory for it)."""
+    spots, model = None, VISION_MODEL
+    if TextReader.installed():
+        try:
+            status("Reading text...")
+            spots, model = TEXT_READER.read(job.image), loaded_model(cfg)
+        except Exception as e:
+            log("Fast text reader failed, using Qwen3-VL instead:", e)
+    job.check()
+    if spots is None:
+        spots = spot_text(job, status)
+    blocks = group_lines(spots)
     target = cfg.get("target") or "en"
     todo = [b for b in blocks if screen_needs_translation(b["text"], target)]
     if todo:
-        for b, eng in zip(todo, translate_screen_text([b["text"] for b in todo], cfg, job, status)):
+        for b, eng in zip(todo, translate_screen_text([b["text"] for b in todo], cfg, job, status, model)):
             if eng and not _same_text(eng, b["text"]):
                 b["eng"] = eng
     return blocks
@@ -3707,6 +3931,19 @@ class App:
         start_hotkey(lambda kind: self.q.put(("screenshot", kind)))
         self.apply_game_mode()
         self.root.after(50, self.poll)
+        self.root.after(8000, self._warm_text_reader)
+
+    def _warm_text_reader(self):
+        """Start the screenshot text reader in the background, so the first screenshot is quick too."""
+        def warm():
+            try:
+                TEXT_READER.start()
+                log("Screenshot text reader ready")
+            except Exception as e:
+                log("Screenshot text reader unavailable (Qwen3-VL will read screenshots):", e)
+
+        if TextReader.installed():
+            threading.Thread(target=warm, daemon=True).start()
 
     # ---- UI ----
     def build_ui(self):
@@ -4405,6 +4642,7 @@ class App:
         self.history.flush()
         HOST.stop()  # close the AI engines and free the GPU memory
         ASR_HOST.stop()
+        TEXT_READER.stop()
         self.root.destroy()
         os._exit(0)
 
@@ -4454,6 +4692,13 @@ def prepare():
                 fixed, out = tr.translate_text(line, lang, [])
                 say(f"Test: {fixed} -> {out}  ({(time.monotonic() - t0) * 1000:.0f} ms)")
 
+        if TextReader.installed():
+            try:
+                msg = TEXT_READER.request({"cmd": "prepare"}, timeout=900)  # also fetches the Korean reader
+                say("Screenshot text reader ready" + ("" if msg.get("korean") else
+                    f" (Korean text unavailable: {msg.get('korean_error')})"))
+            except Exception as e:  # screenshots still work: Qwen3-VL reads them instead (slower)
+                say(f"Screenshot text reader unavailable ({e}) - Qwen3-VL will read screenshots instead.")
         from PIL import Image, ImageDraw
 
         img = Image.new("RGB", (520, 180), (24, 28, 36))  # a small game menu in Chinese
@@ -4468,6 +4713,7 @@ def prepare():
     finally:
         HOST.stop()
         ASR_HOST.stop()
+        TEXT_READER.stop()
 
 
 def install_shortcuts():
@@ -4500,6 +4746,8 @@ def main():
     use_windows_certificates()
     if "--probe-sv-gpu" in sys.argv:
         return probe_sensevoice_gpu()
+    if "--ocr-server" in sys.argv:
+        return ocr_server()
     if "--prepare" in sys.argv:
         return prepare()
     if "--install-shortcuts" in sys.argv:
