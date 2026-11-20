@@ -19,7 +19,7 @@ fullscreen games while it runs.
 - **Per-app audio.** Listen to everything, everything except some apps (e.g. Spotify), or only chosen apps.
 - **Screenshot translation.** Translate text on screen (menus, chat, signs) with a hotkey.
 - **History.** A searchable, timestamped log of every translated line, saved as plain text.
-- **Game mode.** Lower CPU/GPU use and priority so games stay smooth.
+- **Game mode.** Much lighter on the CPU, GPU and video memory so games stay smooth (see below).
 - **Topic and custom words.** Tell it what you're watching and which names or terms to expect.
 
 Supported speech: Mandarin, Cantonese, Korean, Japanese and English with SenseVoice + Qwen3-ASR (Qwen3-ASR
@@ -54,6 +54,7 @@ window to appear on top of the game.
 | `Ctrl+Alt+H` | Hide / show the captions |
 
 Drag the caption box to move it, scroll on it to resize the text, and right-click it for options.
+The **Background** slider fades only the box behind the text; set it to 0 for text with no box.
 
 ## Tips for better accuracy
 
@@ -62,6 +63,18 @@ Drag the caption box to move it, scroll on it to resize the text, and right-clic
   These steer both the speech recognition and the translation.
 - **Spoken language:** set it if you know the language, instead of auto-detect.
 - **Listen to:** choose *Only these apps…* to ignore music and other programs.
+
+## Playing games
+
+- Keep **Game mode** on (it's on by default). Each line is transcribed once, when the speaker pauses,
+  instead of live; plain-English lines skip the second listen; speech recognition stays on the CPU so
+  the GPU's memory goes to the game; the translator's GPU work runs at lower priority than the game;
+  and the captions are fully hidden whenever nobody is talking.
+- Use **Windowed Fullscreen** (borderless) in the game.
+- Cap the game's frame rate a little below what your PC can reach (in Valorant: *Limit FPS Always*).
+  The headroom keeps frame times steady while LiveSubs translates.
+- The screenshot hotkeys swap AI models in video memory, which takes a few seconds of heavy GPU work,
+  so avoid them mid-fight.
 
 ## Files it creates
 
