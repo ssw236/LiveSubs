@@ -201,6 +201,31 @@ def set_priority(pid, low):
         log("Couldn't change priority:", e)
 
 
+def set_gpu_priority(proc=None, low=True):
+    """Game mode: ask Windows to schedule this process's GPU work below the game's frames
+    (D3DKMT scheduling priority class). proc=None means LiveSubs itself."""
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        fn = ctypes.WinDLL("gdi32").D3DKMTSetProcessSchedulingPriorityClass
+        fn.argtypes = [wintypes.HANDLE, ctypes.c_int]
+        fn.restype = ctypes.c_long
+        if proc is None:
+            k32 = ctypes.WinDLL("kernel32")
+            k32.GetCurrentProcess.restype = wintypes.HANDLE
+            handle = k32.GetCurrentProcess()
+        else:
+            handle = int(proc._handle)
+        status = fn(handle, 1 if low else 2)  # 1 = below normal, 2 = normal
+        if status != 0:
+            log(f"GPU priority unchanged (status 0x{status & 0xFFFFFFFF:08X})")
+    except Exception as e:
+        log("GPU priority not available:", e)
+
+
 def load_settings():
     cfg = dict(DEFAULTS)
     saved = {}
@@ -1376,12 +1401,16 @@ class LlamaHost:
     def _start(self, exe, device, key):
         m = LLM_MODELS[key]
         port = _free_port()
-        ctx = "8192" if m.get("mmproj") else "4096"  # subtitles are short; less VRAM left over for the game
+        # Subtitle prompts top out around 1,500 tokens (longest topic, 30 custom words, long lines),
+        # so 2,048 is enough and leaves ~320 MB more video memory for the game than 4,096 did.
+        ctx = "8192" if m.get("mmproj") else "2048"
         args = [exe, "-m", os.path.join(MODELS_DIR, m["file"]), "--host", "127.0.0.1", "--port", str(port),
                 "-dev", device, "-ngl", "all", "-c", ctx, "-np", "1", "--no-webui",
                 "--reasoning-budget", "0"]
         if m.get("mmproj"):
             args += ["--mmproj", os.path.join(MODELS_DIR, m["mmproj"])]
+        else:
+            args += ["-ub", "256"]  # smaller working buffers on the GPU; prompts are short anyway
         if self.lean:
             # everything runs on the GPU, so the CPU side only needs a couple of threads,
             # and --poll 0 stops them spinning at 100% while waiting
@@ -1396,6 +1425,8 @@ class LlamaHost:
                                      stdin=subprocess.DEVNULL, creationflags=flags)
         logf.close()
         _kill_with_us(self.proc)
+        if self.game_mode:
+            set_gpu_priority(self.proc, True)
         self.port, self.key = port, key
         deadline = time.monotonic() + 240
         while time.monotonic() < deadline:
@@ -1424,6 +1455,7 @@ class LlamaHost:
         self.game_mode = on
         if self.running():
             set_priority(self.proc.pid, on)
+            set_gpu_priority(self.proc, on)
 
     def chat(self, key, messages, max_tokens=300, temperature=0.2, timeout=60, status=log, on_text=None):
         """on_text(text_so_far) is called as the reply streams in, if given."""
@@ -3307,6 +3339,7 @@ class App:
     def apply_game_mode(self):
         on = bool(self.cfg.get("game_mode", True))
         set_priority(os.getpid(), on)
+        set_gpu_priority(None, on)
         HOST.set_game_mode(on)
 
     def game_mode_changed(self):
