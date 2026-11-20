@@ -976,9 +976,8 @@ class SenseVoiceASR:
 
         self._so = sherpa_onnx
         self.cpu_model, self.tokens = ensure_sensevoice(status)
-        # Auto + Game mode stays on the CPU: on the GPU, SenseVoice needs ~1.5 GB of video memory
-        # (model + its own CUDA context) that the game and the translator need more.
-        want_gpu = device == "cuda" or (device == "auto" and not game_mode)
+        # The GPU whenever it works: games like Valorant are held back by the processor, not the graphics card
+        want_gpu = device in ("cuda", "auto")
         use_gpu = want_gpu and sensevoice_gpu_ok(status)
         if device == "cuda" and not use_gpu:
             status("GPU speech engine not available - using CPU (run the installer to add it)")
@@ -1052,12 +1051,116 @@ class Qwen3Refiner:
             s.accept_waveform(WHISPER_SR, audio16[:WHISPER_SR * 30])
             self.rec.decode_stream(s)
             text = (s.result.text or "").strip()
+        return trusted_asr_text(text, len(audio16) / WHISPER_SR)
+
+    refine = transcribe  # second-listen interface (same as Qwen3GpuASR.refine)
+
+
+def trusted_asr_text(text, seconds):
+    """Qwen3-ASR output, or '' when there was no real speech or it can't be trusted."""
+    if text.lower() in ("language", "language none") or is_junk(text) or runaway_text(text):
+        return ""
+    if len(text) > 40 + seconds * 25:  # far more text than anyone can say in that time
+        return ""
+    return text
+
+
+# Qwen3-ASR names the language before the text: "language Chinese<asr_text>..."
+QWEN3_LANGS = {
+    "chinese": "zh", "mandarin": "zh", "cantonese": "yue", "english": "en", "japanese": "ja", "korean": "ko",
+    "spanish": "es", "french": "fr", "german": "de", "russian": "ru", "portuguese": "pt", "italian": "it",
+    "arabic": "ar", "hindi": "hi", "thai": "th", "vietnamese": "vi", "indonesian": "id", "turkish": "tr",
+    "polish": "pl", "dutch": "nl", "greek": "el", "filipino": "tl", "tagalog": "tl", "ukrainian": "uk",
+    "hebrew": "he", "malay": "ms", "swedish": "sv", "danish": "da", "finnish": "fi", "czech": "cs",
+    "persian": "fa", "romanian": "ro", "hungarian": "hu", "macedonian": "mk",
+}
+
+
+def parse_qwen3_asr(reply):
+    """'language Chinese<asr_text>你好' -> ('你好', 'zh'). No speech -> ('', '')."""
+    text = re.sub(r"<think>.*?</think>", "", reply or "", flags=re.S).strip()
+    lang = ""
+    m = re.match(r"language\s+([A-Za-z][A-Za-z \-]*?)\s*<asr_text>", text, flags=re.I)
+    if m:
+        name = m.group(1).strip().lower()
+        lang = "" if name == "none" else QWEN3_LANGS.get(name, "")
+        text = text[m.end():]
+    elif "<asr_text>" in text:
+        text = text.split("<asr_text>", 1)[1]
+    elif re.fullmatch(r"language\s+\w+", text, flags=re.I):
+        text = ""  # only a language tag: nothing was said
+    text = text.replace("</asr_text>", "").strip()
+    return text, lang
+
+
+def wav_base64(audio16):
+    """16 kHz float audio -> base64 of a 16-bit mono WAV file (what llama-server takes as input_audio)."""
+    import base64
+    import io
+    import wave
+
+    pcm = (np.clip(audio16, -1.0, 1.0) * 32767).astype("<i2").tobytes()
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(WHISPER_SR)
+        w.writeframes(pcm)
+    return base64.b64encode(buf.getvalue()).decode()
+
+
+class Qwen3GpuASR:
+    """Qwen3-ASR on the graphics card (run by llama.cpp, like the translator). Valorant and most competitive
+    games are held back by the processor, not the graphics card, so in Game mode this is the only speech
+    recognizer: all the heavy listening happens on the GPU and the processor is left to the game."""
+    kind = "qwen3gpu"
+    name = "Qwen3-ASR (GPU)"
+    device = "cuda"
+    live_step = 0.4
+    refiner = None
+
+    def __init__(self, status, words=()):
+        if not model_ready(ASR_MODEL):
+            ensure_model(ASR_MODEL, status)  # ~1 GB, first time only
+        status("Loading Qwen3-ASR on the GPU...")
+        ASR_HOST.use(ASR_MODEL, status)
+        self.words = [w.replace(",", " ") for w in words]
+        self.failures = 0
+        self.listen(np.zeros(WHISPER_SR, np.float32), raise_errors=True)  # warm-up: the engine answers
+
+    def listen(self, audio16, raise_errors=False):
+        """(text, language code) - text is '' for no speech, noise or an untrustworthy result."""
+        audio16 = audio16[:WHISPER_SR * 30]
         seconds = len(audio16) / WHISPER_SR
-        if text.lower() in ("language", "language none") or is_junk(text) or runaway_text(text):
-            return ""
-        if len(text) > 40 + seconds * 25:  # far more text than anyone can say in that time
-            return ""
-        return text
+        messages = []
+        if self.words:  # Qwen3-ASR reads the system text as context: these names/terms get heard right
+            messages.append({"role": "system", "content": ", ".join(self.words)})
+        messages.append({"role": "user", "content": [
+            {"type": "input_audio", "input_audio": {"data": wav_base64(audio16), "format": "wav"}}]})
+        try:
+            reply = ASR_HOST.chat(ASR_MODEL, messages, max_tokens=int(min(400, 40 + 12 * seconds)),
+                                  temperature=0.0, timeout=30)
+            self.failures = 0
+        except Exception as e:
+            if raise_errors:
+                raise
+            self.failures += 1
+            log("Qwen3-ASR (GPU) failed:", e)
+            if self.failures >= 3:  # e.g. the engine crashed: start it again on the next line
+                ASR_HOST.stop()
+                self.failures = 0
+            return "", ""
+        text, lang = parse_qwen3_asr(reply)
+        return trusted_asr_text(text, seconds), lang
+
+    def transcribe(self, audio16, language="", final=True):
+        """Speech-model interface (Game mode: the only recognizer). Returns (text, language code)."""
+        text, lang = self.listen(audio16)
+        return text, lang or text_language(text, "en")
+
+    def refine(self, audio16):
+        """Second-listen interface (outside Game mode, after SenseVoice's quick version)."""
+        return self.listen(audio16)[0]
 
 
 class SpeechGate:
@@ -1166,9 +1269,25 @@ class WhisperASR:
 
 
 def load_asr(engine, device, status, game_mode=True, words=()):
+    gpu = None
+    if engine == "qwen3" and device != "cpu":
+        try:
+            gpu = Qwen3GpuASR(status, words)
+        except Exception as e:
+            log("Qwen3-ASR on the GPU unavailable, using the CPU version:", traceback.format_exc())
+            status(f"Qwen3-ASR couldn't use the GPU ({str(e)[:60]}) - using the CPU")
+    if gpu is None:
+        ASR_HOST.stop()  # not needed (CPU chosen, other engine, or it failed): free its video memory
+    elif game_mode:
+        # Game mode: one recognizer, entirely on the GPU. SenseVoice isn't loaded at all, so the
+        # processor - what Valorant and most competitive games are short of - is left to the game.
+        return gpu
     if engine in ("sensevoice", "qwen3"):
         asr = SenseVoiceASR(status, game_mode, device)
-        if engine == "qwen3":
+        if gpu is not None:
+            asr.refiner = gpu
+            asr.name = "SenseVoice + Qwen3-ASR (GPU)"
+        elif engine == "qwen3":
             try:
                 asr.refiner = Qwen3Refiner(status, game_mode, words)
                 asr.name = "Qwen3-ASR + SenseVoice"
@@ -1260,7 +1379,12 @@ LLM_MODELS = {
     "qwen3-vl-8b": {"label": "Qwen3-VL 8B", "repo": "Qwen/Qwen3-VL-8B-Instruct-GGUF",
                     "file": "Qwen3VL-8B-Instruct-Q4_K_M.gguf",
                     "mmproj": "mmproj-Qwen3VL-8B-Instruct-Q8_0.gguf", "size": "6 GB"},
+    # speech recognition on the GPU: the same Qwen3-ASR, run by llama.cpp instead of on the CPU
+    "qwen3-asr-0.6b": {"label": "Qwen3-ASR (GPU)", "repo": "ggml-org/Qwen3-ASR-0.6B-GGUF",
+                       "file": "Qwen3-ASR-0.6B-Q8_0.gguf", "mmproj": "mmproj-Qwen3-ASR-0.6B-Q8_0.gguf",
+                       "mmproj_label": "audio reader", "size": "1 GB", "ctx": 2048},
 }
+ASR_MODEL = "qwen3-asr-0.6b"
 LLM_LOG = os.path.join(APP_DIR, "ai-engine.log")
 
 
@@ -1299,7 +1423,7 @@ def ensure_model(key, status):
     for f in model_files(key):
         path = os.path.join(MODELS_DIR, f)
         if not os.path.exists(path):
-            label = m["label"] + (" (image reader)" if f.startswith("mmproj") else "")
+            label = m["label"] + (f" ({m.get('mmproj_label', 'image reader')})" if f.startswith("mmproj") else "")
             download(f"https://huggingface.co/{m['repo']}/resolve/main/{f}", path, status, label)
 
 
@@ -1407,7 +1531,7 @@ class LlamaHost:
         port = _free_port()
         # Subtitle prompts top out around 1,500 tokens (longest topic, 30 custom words, long lines),
         # so 2,048 is enough and leaves ~320 MB more video memory for the game than 4,096 did.
-        ctx = "8192" if m.get("mmproj") else "2048"
+        ctx = str(m.get("ctx") or (8192 if m.get("mmproj") else 2048))
         args = [exe, "-m", os.path.join(MODELS_DIR, m["file"]), "--host", "127.0.0.1", "--port", str(port),
                 "-dev", device, "-ngl", "all", "-c", ctx, "-np", "1", "--no-webui",
                 "--reasoning-budget", "0"]
@@ -1504,7 +1628,8 @@ class LlamaHost:
                     p.kill()
 
 
-HOST = LlamaHost()
+HOST = LlamaHost()      # translator (and the screenshot reader, swapped in when needed)
+ASR_HOST = LlamaHost()  # speech recognition on the GPU; stays loaded next to the translator
 
 
 def _unquote(text):
@@ -1844,7 +1969,7 @@ class Listener(threading.Thread):
                     text = quick  # falling behind: skip the slow second listen for this line
                 else:
                     t0 = time.monotonic()
-                    text = self.asr.refiner.transcribe(audio16)
+                    text = self.asr.refiner.refine(audio16)
                     log(f"  second listen ({(time.monotonic() - t0) * 1000:.0f} ms): {text!r}  (quick: {quick!r})")
             except Exception:
                 log(traceback.format_exc())
@@ -1868,7 +1993,7 @@ class Listener(threading.Thread):
         if self.translator.ready_model:
             differs = alt and _PUNCT.sub("", alt).lower() != _PUNCT.sub("", text).lower()
             self.translator.submit(line_id, text, lang, alt=alt if differs else None,
-                                   fix=lang in FIX_LANGS and kind != "refined")
+                                   fix=lang in FIX_LANGS and kind != "refined" and self.asr.kind == "sensevoice")
         elif whisper:  # no AI translator: fall back to Whisper's own
             eng = self.asr.translate(audio16, det)
             if eng:
@@ -3917,13 +4042,14 @@ class App:
         set_priority(os.getpid(), on)
         set_gpu_priority(None, on)
         HOST.set_game_mode(on)
+        ASR_HOST.set_game_mode(on)
 
     def game_mode_changed(self):
         self.cfg["game_mode"] = bool(self.game_var.get())
         save_settings(self.cfg)
         self.apply_game_mode()
         if self.cfg["engine"] in ("sensevoice", "qwen3"):
-            self.load_asr()  # picks up the new thread count and CPU/GPU choice
+            self.load_asr()  # Game mode uses Qwen3-ASR alone on the GPU; otherwise SenseVoice adds live text
 
     def set_locked(self, locked):
         """Locked = can't be dragged or resized, and clicks go straight through to the game."""
@@ -4048,7 +4174,8 @@ class App:
         if lst:
             lst.join(timeout=1.5)
         self.history.flush()
-        HOST.stop()  # close the AI engine and free the GPU memory
+        HOST.stop()  # close the AI engines and free the GPU memory
+        ASR_HOST.stop()
         self.root.destroy()
         os._exit(0)
 
@@ -4065,21 +4192,27 @@ def prepare():
     def say(s):
         print("       " + s, flush=True)
 
-    asr = load_asr(cfg["engine"], cfg["device"], say, cfg.get("game_mode", True), parse_words(cfg.get("words")))
-    say(f"Speech model ready: {asr.name} ({'GPU' if asr.device == 'cuda' else 'CPU'})")
-    SpeechGate(say)
-    say("Voice detector ready.")
-    SpeakerTracker(say)
-    say("Speaker model ready.")
-
     ensure_llama_builds(say)
     say("AI engine downloaded.")
-    keys = [VISION_MODEL] + ([cfg["translator"]] if cfg["translator"] not in ("off", VISION_MODEL) else [])
+    keys = [VISION_MODEL, ASR_MODEL] + ([cfg["translator"]] if cfg["translator"] not in ("off", VISION_MODEL) else [])
     for key in keys:
         ensure_model(key, say)
+    ensure_sensevoice(say)  # CPU speech models: live text outside Game mode, and the fallback without a GPU
+    ensure_qwen3asr(say)
     say("AI models downloaded.")
 
     try:
+        asr = load_asr(cfg["engine"], cfg["device"], say, cfg.get("game_mode", True), parse_words(cfg.get("words")))
+        say(f"Speech model ready: {asr.name} ({'GPU' if asr.device == 'cuda' else 'CPU'})")
+        if asr.kind == "qwen3gpu":
+            t0 = time.monotonic()
+            asr.listen(np.zeros(WHISPER_SR * 3, np.float32))
+            say(f"Speech recognition on the GPU: {(time.monotonic() - t0) * 1000:.0f} ms per line")
+        SpeechGate(say)
+        say("Voice detector ready.")
+        SpeakerTracker(say)
+        say("Speaker model ready.")
+
         if cfg["translator"] != "off":
             tr = Translator(cfg, queue.Queue())
             err = tr.prepare(say)
@@ -4105,6 +4238,7 @@ def prepare():
         say(f"Screenshot test: {found}  ({time.monotonic() - t0:.1f} s)")
     finally:
         HOST.stop()
+        ASR_HOST.stop()
 
 
 def install_shortcuts():

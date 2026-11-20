@@ -20,7 +20,7 @@ fullscreen games while it runs.
 - **Screenshot translation.** Press a hotkey and the screenshot comes back with English painted over the
   foreign text, right where it was (like Google Lens). Works on menus, chat, signs and video subtitles.
 - **History.** A searchable, timestamped log of every translated line, saved as plain text.
-- **Game mode.** Much lighter on the CPU, GPU and video memory so games stay smooth (see below).
+- **Game mode.** Speech recognition moves onto the graphics card, so the CPU is left to the game (see below).
 - **Topic and custom words.** Tell it what you're watching and which names or terms to expect.
 
 Supported speech: Mandarin, Cantonese, Korean, Japanese and English with SenseVoice + Qwen3-ASR (Qwen3-ASR
@@ -31,14 +31,14 @@ also handles many other languages), or any language Whisper supports.
 - Windows 10 (version 2004 or newer) or Windows 11
 - An NVIDIA GPU with 12 GB+ of video memory is recommended for the default translator
   (pick Qwen3 8B in the app if you have less; other GPUs may work through Vulkan)
-- About 18 GB of free disk space for the AI models
+- About 19 GB of free disk space for the AI models
 - Python 3.12 (the installer looks for it and points you to the download if it's missing)
 
 ## Install
 
 1. Download this repository (green **Code** button → **Download ZIP**) and unzip it, or `git clone` it.
 2. Double-click **Install LiveSubs.bat**. It installs the Python packages, downloads the models and creates
-   Desktop and Start menu shortcuts. The first run downloads about 18 GB; if it's interrupted, run it again
+   Desktop and Start menu shortcuts. The first run downloads about 19 GB; if it's interrupted, run it again
    and it continues where it stopped.
 3. Open **LiveSubs** from the Desktop shortcut.
 
@@ -78,10 +78,12 @@ belong to one sentence (a wrapped paragraph or a two-line subtitle) are translat
 
 ## Playing games
 
-- Keep **Game mode** on (it's on by default). Each line is transcribed once, when the speaker pauses,
-  instead of live; plain-English lines skip the second listen; speech recognition stays on the CPU so
-  the GPU's memory goes to the game; the translator's GPU work runs at lower priority than the game;
-  and the captions are fully hidden whenever nobody is talking.
+- Keep **Game mode** on (it's on by default). Games like Valorant are held back by the CPU, not the
+  graphics card, so Game mode does the heavy work on the GPU: Qwen3-ASR runs there by itself (through
+  llama.cpp, using about 1.5 GB of video memory), and each line is transcribed once, when the speaker
+  pauses, instead of live. The CPU only checks whether someone is talking and whose voice it is. All of
+  LiveSubs' GPU work runs at lower priority than the game's, and the captions are fully hidden whenever
+  nobody is talking.
 - Use **Windowed Fullscreen** (borderless) in the game.
 - Cap the game's frame rate a little below what your PC can reach (in Valorant: *Limit FPS Always*).
   The headroom keeps frame times steady while LiveSubs translates.
@@ -104,8 +106,8 @@ These stay on your PC and are excluded from git by `.gitignore`:
 ```
 speakers / chosen apps (WASAPI loopback)
   → Silero VAD: is someone talking?
-  → SenseVoice: instant first version of the line
-  → Qwen3-ASR: second, more careful listen
+  → SenseVoice: instant first version of the line      (not used in Game mode)
+  → Qwen3-ASR via llama.cpp (GPU): careful listen      (CPU version if there's no GPU)
   → Qwen3 14B via llama.cpp (GPU): natural English
   → caption box + history
 ```
@@ -117,8 +119,9 @@ Screenshot translation uses Qwen3-VL 8B. Speaker colours use a 3D-Speaker voice-
 - [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx): runs SenseVoice, Qwen3-ASR, Silero VAD and speaker models
 - [SenseVoice](https://github.com/FunAudioLLM/SenseVoice), Qwen3-ASR, [Silero VAD](https://github.com/snakers4/silero-vad),
   [3D-Speaker](https://github.com/modelscope/3D-Speaker)
-- [llama.cpp](https://github.com/ggml-org/llama.cpp) with [Qwen3](https://huggingface.co/Qwen/Qwen3-14B-GGUF) and
-  [Qwen3-VL](https://huggingface.co/Qwen/Qwen3-VL-8B-Instruct-GGUF)
+- [llama.cpp](https://github.com/ggml-org/llama.cpp) with [Qwen3](https://huggingface.co/Qwen/Qwen3-14B-GGUF),
+  [Qwen3-VL](https://huggingface.co/Qwen/Qwen3-VL-8B-Instruct-GGUF) and
+  [Qwen3-ASR](https://huggingface.co/ggml-org/Qwen3-ASR-0.6B-GGUF)
 - [faster-whisper](https://github.com/SYSTRAN/faster-whisper), [PyAudioWPatch](https://github.com/s0d3s/PyAudioWPatch),
   [pycaw](https://github.com/AndreMiras/pycaw)
 

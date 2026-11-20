@@ -34,7 +34,7 @@ if errorlevel 1 echo        (GPU speech engine unavailable - the listener will u
 :nogpu
 echo.
 echo  [3/4] Downloading and testing the AI engine and models...
-echo        (first time: about 18 GB - grab a drink. If it gets interrupted,
+echo        (first time: about 19 GB - grab a drink. If it gets interrupted,
 echo         just run this setup again and it carries on where it stopped.)
 "%PY%" livesubs.pyw --prepare || goto :fail
 echo.
