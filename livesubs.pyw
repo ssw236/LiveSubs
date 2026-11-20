@@ -1949,6 +1949,7 @@ def _user32():
         u.SetForegroundWindow.argtypes = [wintypes.HWND]
         u.IsWindow.argtypes = [wintypes.HWND]
         u.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
+        u.SetLayeredWindowAttributes.argtypes = [wintypes.HWND, wintypes.DWORD, wintypes.BYTE, wintypes.DWORD]
         _U32 = u
     return _U32
 
@@ -2005,6 +2006,18 @@ def game_safe(win, click_through=False):
         u.SetWindowPos(hwnd, -1, 0, 0, 0, 0, SWP_FLAGS | 0x0020)  # + FRAMECHANGED
     except Exception as e:
         log("Window setup failed:", e)
+
+
+def set_window_alpha(win, alpha):
+    """How solid a window is (0-1). On Windows this must follow game_safe(): a window made layered isn't
+    drawn reliably until its layered attributes are set."""
+    if sys.platform != "win32":
+        win.attributes("-alpha", alpha)
+        return
+    try:
+        _user32().SetLayeredWindowAttributes(_hwnd(win), 0, max(0, min(255, round(alpha * 255))), 0x2)  # LWA_ALPHA
+    except Exception as e:
+        log("Window transparency failed:", e)
 
 
 def foreground_window():
@@ -2112,10 +2125,10 @@ class Overlay:
         completely while nobody's talking or when hidden, so nothing sits over the game."""
         opacity = max(0.0, min(1.0, float(self.cfg["opacity"])))
         visible = not (self.faded or self.user_hidden)
-        self.back.attributes("-alpha", opacity)
         locked = self.cfg["click_through"]
         game_safe(self.back, click_through=locked)
-        game_safe(self.win, click_through=locked)
+        game_safe(self.win, click_through=locked)  # its see-through text background is set by Tk
+        set_window_alpha(self.back, opacity)
         show_window(self.back, visible and opacity > 0.02)
         show_window(self.win, visible)
         if visible and not self.shown:
