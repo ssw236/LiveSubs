@@ -33,18 +33,24 @@ also handles many other languages), or any language Whisper supports.
 ## Requirements
 
 - Windows 10 (version 2004 or newer) or Windows 11
-- An NVIDIA GPU with 12 GB+ of video memory is recommended for the default translator
-  (pick Qwen3 8B in the app if you have less; other GPUs may work through Vulkan)
-- About 19 GB of free disk space for the AI models
+- A graphics card with 12 GB+ of video memory for the best translator (Qwen3 14B), or 8 GB+ for the smaller,
+  faster one (Qwen3 8B). NVIDIA cards use CUDA; others may work through Vulkan.
+- About 11 GB of free disk space for the AI models (7 GB with the smaller translator)
 - Python 3.12. If it's missing, the installer downloads it from python.org and installs it for you
   (for your Windows user only, so no admin rights are needed)
 
 ## Install
 
 1. Download this repository (green **Code** button → **Download ZIP**) and unzip it, or `git clone` it.
-2. Double-click **Install LiveSubs.bat**. It installs Python 3.12 if you don't have it, then the Python
-   packages, downloads the models and creates Desktop and Start menu shortcuts. The first run downloads
-   about 19 GB; if it's interrupted, run it again and it continues where it stopped.
+2. Double-click **Install LiveSubs.bat**. It asks which translator you want (best quality or smaller and
+   faster), installs Python 3.12 if you don't have it, then the Python packages, downloads the models and
+   creates Desktop and Start menu shortcuts. The first run downloads about 11 GB (7 GB with the smaller
+   translator); if it's interrupted, run it again and it continues where it stopped.
+
+   It only downloads what the default setup uses. A few extras download by themselves the first time
+   they're needed: Qwen3-VL (screenshots, if the text reader can't run), the CPU version of Qwen3-ASR (if
+   your graphics card can't run it), and the other translator if you switch to it. The installer also
+   offers an optional GPU speed-up for the Whisper speech engines (1.7 GB).
 3. Open **LiveSubs** from the Desktop shortcut.
 
 In games, use **Windowed Fullscreen** (borderless) display mode. Exclusive fullscreen doesn't allow any

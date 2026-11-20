@@ -10,22 +10,26 @@ call :findpython
 if not defined PY call :getpython
 if not defined PY goto :nopython
 echo        Using %PY%
+
+rem First install only: pick the translator, the biggest download
+set "TRARG="
+if exist settings.json goto :picked
+echo.
+echo  Which translator do you want? You can switch later in the app.
+echo    1 = Best quality         Qwen3 14B - 9 GB download, for graphics cards with 12 GB or more
+echo    2 = Smaller and faster   Qwen3 8B  - 5 GB download, for graphics cards with 8 GB or more
+choice /c 12 /n /t 60 /d 1 /m "  Press 1 or 2: "
+if errorlevel 2 (set "TRARG=--translator qwen3-8b") else (set "TRARG=--translator qwen3-14b")
+:picked
 echo.
 echo  [2/4] Installing packages (can take a few minutes)...
 "%PY%" -m pip install --disable-pip-version-check -q --upgrade -r requirements.txt || goto :fail
-where nvidia-smi >nul 2>&1
-if errorlevel 1 goto :nogpu
-echo        NVIDIA GPU found - installing GPU libraries...
-"%PY%" -m pip install --disable-pip-version-check -q nvidia-cublas-cu12 "nvidia-cudnn-cu12==9.*" nvidia-cuda-runtime-cu12 nvidia-cufft-cu12 nvidia-curand-cu12 || goto :fail
-echo        Installing the GPU version of the speech engine...
-"%PY%" -m pip install --disable-pip-version-check -q "sherpa-onnx==2.0.1+cuda12.cudnn9" -f https://k2-fsa.github.io/sherpa/onnx/cuda.html
-if errorlevel 1 echo        (GPU speech engine unavailable - the listener will use the CPU instead)
-:nogpu
+call :whispergpu
 echo.
 echo  [3/4] Downloading and testing the AI engine and models...
-echo        (first time: about 19 GB - grab a drink. If it gets interrupted,
-echo         just run this setup again and it carries on where it stopped.)
-"%PY%" livesubs.pyw --prepare || goto :fail
+echo        (first time: about 11 GB, or 7 GB with the smaller translator. If it gets
+echo         interrupted, just run this setup again and it carries on where it stopped.)
+"%PY%" livesubs.pyw --prepare %TRARG% || goto :fail
 echo.
 echo  [4/4] Creating Desktop and Start menu shortcuts...
 "%PY%" livesubs.pyw --install-shortcuts || goto :fail
@@ -52,6 +56,23 @@ echo  Something went wrong - see the messages above for details.
 echo.
 pause
 exit /b 1
+
+:whispergpu
+rem Optional: GPU libraries for the Whisper speech engines. The default setup doesn't need them: its speech
+rem recognition already runs on the graphics card through the AI engine.
+where nvidia-smi >nul 2>&1 || exit /b 0
+"%PY%" -m pip show -q nvidia-cudnn-cu12 >nul 2>&1 && goto :whispergpu_install
+echo.
+echo  Optional: GPU speed-up for the Whisper speech engines - 1.7 GB more.
+echo  Not needed for the default setup, which already uses your graphics card.
+choice /c YN /n /t 20 /d N /m "  Add it? Press Y or N: "
+if errorlevel 2 exit /b 0
+:whispergpu_install
+echo        Installing the GPU libraries for Whisper...
+"%PY%" -m pip install --disable-pip-version-check -q nvidia-cublas-cu12 "nvidia-cudnn-cu12==9.*" nvidia-cuda-runtime-cu12 nvidia-cufft-cu12 nvidia-curand-cu12 || exit /b 0
+"%PY%" -m pip install --disable-pip-version-check -q "sherpa-onnx==2.0.1+cuda12.cudnn9" -f https://k2-fsa.github.io/sherpa/onnx/cuda.html
+if errorlevel 1 echo        (GPU version of the speech engine unavailable - SenseVoice will use the CPU)
+exit /b 0
 
 :findpython
 rem Sets PY to a working Python 3.12, or leaves it empty.

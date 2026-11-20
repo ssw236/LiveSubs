@@ -63,8 +63,7 @@ ENGINES = {
 DEVICES = {"Auto": "auto", "GPU": "cuda", "CPU": "cpu"}
 TRANSLATORS = {
     "Qwen3 14B (best)": "qwen3-14b",
-    "Qwen3 8B (faster)": "qwen3-8b",
-    "Qwen3-VL 8B (faster, no wait after screenshots)": "qwen3-vl-8b",
+    "Qwen3 8B (faster, smaller download)": "qwen3-8b",
     "Off": "off",
 }
 SHOW_MODES = {"Original + translation": "both", "Translation only": "english", "Original only": "original"}
@@ -331,6 +330,8 @@ def load_settings():
         pass
     if cfg["engine"] not in ENGINES.values():
         cfg["engine"] = DEFAULTS["engine"]
+    if cfg["translator"] == "qwen3-vl-8b":  # no longer offered as a translator: the closest choice
+        cfg["translator"] = "qwen3-8b"
     if cfg["translator"] not in TRANSLATORS.values():
         cfg["translator"] = DEFAULTS["translator"]
     if cfg.get("target") not in dict(TARGETS).values():
@@ -1558,11 +1559,23 @@ def llama_exe(backend):
     return os.path.join(LLAMA_DIR, backend, "llama-server.exe")
 
 
-def ensure_llama_builds(status):
+def has_nvidia_gpu():
+    if sys.platform == "win32":
+        return os.path.exists(os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "nvcuda.dll"))
+    import shutil
+
+    return shutil.which("nvidia-smi") is not None
+
+
+def ensure_llama_builds(status, backends=None):
+    """Downloads the AI engine. By default only the build this PC needs: CUDA for NVIDIA graphics cards
+    (590 MB), Vulkan for others (40 MB). The other one is fetched later only if that one fails."""
     import zipfile
 
+    if backends is None:
+        backends = ["cuda"] if has_nvidia_gpu() else ["vulkan"]
     for backend, _dev, urls in LLAMA_BUILDS:
-        if os.path.exists(llama_exe(backend)):
+        if backend not in backends or os.path.exists(llama_exe(backend)):
             continue
         dest = os.path.join(LLAMA_DIR, backend)
         os.makedirs(dest, exist_ok=True)
@@ -1669,7 +1682,13 @@ class LlamaHost:
             for backend, device, _urls in builds:
                 exe = llama_exe(backend)
                 if not os.path.exists(exe):
-                    continue
+                    if not errors:
+                        continue  # only needed if the build we have fails
+                    try:
+                        ensure_llama_builds(status, [backend])
+                    except Exception as e:
+                        errors.append(f"{backend}: couldn't download it ({e})")
+                        continue
                 status(f"Loading {label} on the GPU...")
                 try:
                     try:
@@ -2928,6 +2947,9 @@ def vision_image(image):
 
 def spot_text(job, status=log):
     """Every line of text in the screenshot: [{'box': (x1, y1, x2, y2) in screenshot pixels, 'text': str}]."""
+    if not model_ready(VISION_MODEL):  # only needed when the text reader isn't available
+        ensure_model(VISION_MODEL, status)
+        job.check()
     W, H = job.image.size
     uri, (sent_w, sent_h) = vision_image(job.image)
     found = [0]
@@ -3223,7 +3245,10 @@ def loaded_model(cfg):
     """The AI model already on the GPU (so screenshot text is translated without swapping anything in)."""
     if HOST.running():
         return HOST.key
-    return cfg["translator"] if cfg["translator"] != "off" else VISION_MODEL
+    if cfg["translator"] != "off":
+        return cfg["translator"]
+    # captions aren't being translated: use any model that's already downloaded, else the small one
+    return next((k for k in ("qwen3-8b", "qwen3-14b", VISION_MODEL) if model_ready(k)), "qwen3-8b")
 
 
 def translate_screen_text(texts, cfg, job, status=log, model=VISION_MODEL):
@@ -3260,6 +3285,9 @@ def read_screenshot(job, cfg, status=log):
     blocks = group_lines(spots)
     target = cfg.get("target") or "en"
     todo = [b for b in blocks if screen_needs_translation(b["text"], target)]
+    if todo and not model_ready(model):
+        ensure_model(model, status)  # e.g. the translator was switched off and nothing is downloaded
+        job.check()
     if todo:
         for b, eng in zip(todo, translate_screen_text([b["text"] for b in todo], cfg, job, status, model)):
             if eng and not _same_text(eng, b["text"]):
@@ -4659,13 +4687,19 @@ def prepare():
     def say(s):
         print("       " + s, flush=True)
 
+    if "--translator" in sys.argv:  # picked in the installer on a first install
+        choice = sys.argv[sys.argv.index("--translator") + 1]
+        if choice in TRANSLATORS.values():
+            cfg["translator"] = choice
+            save_settings(cfg)
     ensure_llama_builds(say)
     say("AI engine downloaded.")
-    keys = [VISION_MODEL, ASR_MODEL] + ([cfg["translator"]] if cfg["translator"] not in ("off", VISION_MODEL) else [])
+    # Only what the default setup uses. Qwen3-VL (screenshots without the text reader) and the CPU copy of
+    # Qwen3-ASR (no usable GPU) download by themselves if they're ever needed.
+    keys = [ASR_MODEL] + ([cfg["translator"]] if cfg["translator"] != "off" else [])
     for key in keys:
         ensure_model(key, say)
-    ensure_sensevoice(say)  # CPU speech models: live text outside Game mode, and the fallback without a GPU
-    ensure_qwen3asr(say)
+    ensure_sensevoice(say)  # small: live text outside Game mode
     say("AI models downloaded.")
 
     try:
