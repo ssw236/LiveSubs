@@ -23,7 +23,8 @@ fullscreen games while it runs.
 - **Screenshot translation.** Press a hotkey and the screenshot comes back with the translation painted over
   the foreign text, right where it was (like Google Lens), usually in a second or two. Works on menus,
   chat, signs and video subtitles.
-- **History.** A searchable, timestamped log of every translated line, saved as plain text.
+- **History.** A searchable, timestamped log of every translated line. Only the last 2 sessions are kept;
+  older chat logs delete themselves.
 - **Game mode.** Speech recognition moves onto the graphics card, so the CPU is left to the game (see below).
 - **Topic and custom words.** Tell it what you're watching and which names or terms to expect.
 
@@ -81,7 +82,7 @@ reader isn't available, Qwen3-VL reads the screenshot instead, which takes longe
 - **Close it:** click it, press `Esc`, or press the same hotkey again (this also cancels one that's still
   being read).
 - **Copy the translation:** right-click it.
-- Every translated screenshot is saved in the history.
+- Translated screenshots go in the history too.
 
 ## Captions in other languages
 
@@ -91,6 +92,14 @@ already in it is shown as it is (tick *Hide lines that don't need translating* t
 Tick **Both ways** to translate in both directions: with captions in Chinese, English speech gets Chinese
 captions and Chinese speech gets English captions. That suits a mixed lobby or watching with someone who
 reads the other language. Screenshot translation uses the same caption language.
+
+## History
+
+**History & chat log** on the control panel shows every translated line and screenshot. Search it, pick the
+session to show, or **Export** it to a text file.
+
+Only the last 2 sessions are kept on your PC (each time you open LiveSubs is a session): this one and the one
+before. Older chat logs delete themselves.
 
 ## Tips for better accuracy
 
@@ -120,9 +129,9 @@ These stay on your PC and are excluded from git by `.gitignore`:
 | Path | What it is |
 | --- | --- |
 | `models/` | Downloaded AI models and the llama.cpp engine |
-| `history/` | Your chat logs (`.txt` to read, `.jsonl` for the app) |
+| `history/` | Your chat logs from the last 2 sessions (`.txt` to read, `.jsonl` for the app) |
 | `settings.json` | Your settings |
-| `livesubs.log`, `ai-engine.log`, `text-reader.log` | Logs for troubleshooting |
+| `livesubs.log`, `ai-engine.log`, `text-reader.log` | Logs for troubleshooting. They start fresh each time LiveSubs opens |
 
 ## How it works
 

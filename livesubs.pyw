@@ -124,9 +124,13 @@ DEFAULTS = {
     "font": 20, "opacity": 0.75, "width": 0.5, "hold": 7.0,
     "threshold": 0.008, "silence": 0.6, "max_seg": 8.0,
     "click_through": False, "autostart": True, "pos": None,
-    "history": 2, "speakers": True, "save_history": True, "layout_v": 2,
+    "history": 2, "speakers": True, "layout_v": 2,
     "game_mode": True, "target": "en", "both_ways": False,
 }
+
+# Chat logs of this many sessions stay on disk (a session = each time LiveSubs is opened);
+# older ones delete themselves.
+KEEP_SESSIONS = 2
 
 _ASR_REL = "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models"
 SV_NAME = "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17"
@@ -277,6 +281,25 @@ _line_ids = itertools.count(1)
 
 def log(*a):
     print(time.strftime("[%H:%M:%S]"), *a, flush=True)
+
+
+_log_lock = threading.Lock()
+_fresh_logs = set()
+
+
+def open_log(path, binary=False):
+    """Opens a log for a helper program to write to. Like livesubs.log, each log starts empty the
+    first time it's used in a run, so the logs never pile up."""
+    with _log_lock:
+        if path not in _fresh_logs:
+            _fresh_logs.add(path)
+            try:
+                open(path, "w").close()
+            except OSError:
+                pass
+    if binary:
+        return open(path, "ab")
+    return open(path, "a", encoding="utf-8", errors="replace")
 
 
 BELOW_NORMAL = 0x4000  # BELOW_NORMAL_PRIORITY_CLASS
@@ -1728,7 +1751,7 @@ class LlamaHost:
             # everything runs on the GPU, so the CPU side only needs a couple of threads,
             # and --poll 0 stops them spinning at 100% while waiting
             args += ["-t", "2", "-tb", "2", "--poll", "0"]
-        logf = open(LLM_LOG, "ab")
+        logf = open_log(LLM_LOG, binary=True)
         logf.write(f"\n===== {time.ctime()} {' '.join(args)}\n".encode())
         logf.flush()
         flags = 0x08000000 if sys.platform == "win32" else 0  # CREATE_NO_WINDOW
@@ -3179,7 +3202,7 @@ class TextReader:
         console = os.path.join(os.path.dirname(exe), "python.exe")
         if os.path.basename(exe).lower() == "pythonw.exe" and os.path.exists(console):
             exe = console  # pipes are dependable with the console Python (no window is shown)
-        err = open(OCR_LOG, "a", encoding="utf-8", errors="replace")
+        err = open_log(OCR_LOG)
         self.replies = queue.Queue()
         self.proc = subprocess.Popen([exe, os.path.abspath(__file__), "--ocr-server"], cwd=APP_DIR,
                                      stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=err,
@@ -3654,6 +3677,31 @@ def list_sessions():
     return sorted(names, reverse=True)
 
 
+SESSION_NAME = re.compile(r"\d{4}-\d{2}-\d{2} \d{2}-\d{2}-\d{2}$")
+
+
+def saved_sessions():
+    """Every session with a chat log on disk (.jsonl and/or .txt), newest first. Only LiveSubs'
+    own file names count, so nothing else in the folder is ever touched."""
+    try:
+        files = os.listdir(HISTORY_DIR)
+    except OSError:
+        return []
+    names = {os.path.splitext(f)[0] for f in files if f.endswith((".jsonl", ".txt"))}
+    return sorted((n for n in names if SESSION_NAME.match(n)), reverse=True)
+
+
+def delete_sessions(names):
+    for name in names:
+        for ext in (".jsonl", ".txt"):
+            try:
+                os.remove(os.path.join(HISTORY_DIR, name + ext))
+            except FileNotFoundError:
+                pass
+            except OSError as e:
+                log("Couldn't delete an old chat log:", e)
+
+
 def load_session(name):
     out = []
     try:
@@ -3669,7 +3717,8 @@ def load_session(name):
 
 
 class History:
-    """Keeps every finished line and screenshot translation, and writes them to history/."""
+    """Keeps every finished line and screenshot translation, and writes them to history/ (one pair
+    of files per session). Only the last 2 sessions stay on disk: older chat logs delete themselves."""
     WAIT_FOR_ENGLISH = 20  # seconds to wait for a translation before logging without one
 
     def __init__(self, cfg):
@@ -3678,10 +3727,20 @@ class History:
         self.entries = []
         self.pending = {}     # line_id -> entry still waiting for its English
         self.listeners = []   # called with the full entry list whenever it changes
+        self.on_disk = False  # this session's log has been started
+        self.clean_up()
+
+    def clean_up(self):
+        """Deletes the chat logs older than the last KEEP_SESSIONS sessions. This session only counts
+        once something from it is saved, so the one before stays readable until then."""
+        names = saved_sessions()
+        keep = KEEP_SESSIONS - (1 if self.session in names else 0)
+        old = [n for n in names if n != self.session][keep:]
+        if old:
+            delete_sessions(old)
+            log(f"Deleted {len(old)} old chat log{'s' if len(old) != 1 else ''}")
 
     def _write(self, e):
-        if not self.cfg.get("save_history", True):
-            return
         try:
             os.makedirs(HISTORY_DIR, exist_ok=True)
             base = os.path.join(HISTORY_DIR, self.session)
@@ -3691,6 +3750,10 @@ class History:
                 f.write(format_entry(e) + "\n")
         except Exception as ex:
             log("Couldn't save history:", ex)
+            return
+        if not self.on_disk:
+            self.on_disk = True
+            self.clean_up()  # this session is now one of the kept ones
 
     def _commit(self, e):
         self.entries.append(e)
@@ -3784,17 +3847,10 @@ class HistoryWindow:
         self.text.bind("<Key>", lambda e: None if (e.state & 0x4 and e.keysym.lower() in ("c", "a")) else "break")
 
         bot = ttk.Frame(w, padding=10)
-        bot.pack(fill="x")
-        self.save_var = tk.BooleanVar(value=cfg.get("save_history", True))
-        ttk.Checkbutton(bot, text="Save chat logs to disk", variable=self.save_var,
-                        command=self._save_toggled).pack(side="left")
-        self.count = tk.StringVar()
-        ttk.Label(bot, textvariable=self.count, foreground="#888").pack(side="left", padx=12)
-        ttk.Button(bot, text="Open folder", command=self.open_folder).pack(side="right")
-        ttk.Button(bot, text="Export...", command=self.export).pack(side="right", padx=6)
-        ttk.Button(bot, text="Copy", command=self.copy).pack(side="right")
+        bot.pack(fill="x", side="bottom", before=mid)  # stays visible when the window is made small
+        ttk.Button(bot, text="Export...", command=self.export).pack(side="right")
 
-        self.entries, self.shown = [], []
+        self.entries, self.shown, self.sessions = [], [], None
         self.history.listeners.append(self._live)
         w.protocol("WM_DELETE_WINDOW", self.close)
         self.refresh_sessions()
@@ -3802,10 +3858,16 @@ class HistoryWindow:
 
     # ---- data ----
     def refresh_sessions(self):
-        past = [s for s in list_sessions() if s != self.history.session]
-        self.session_cb.config(values=[self.THIS] + past)
-        if not self.session_cb.get():
+        """Updates the session list. Returns True if the session being shown was deleted
+        (it switches back to this session)."""
+        names = [self.THIS] + [s for s in list_sessions() if s != self.history.session]
+        if names != self.sessions:
+            self.sessions = names
+            self.session_cb.config(values=names)
+        if self.session_cb.get() not in names:
             self.session_cb.set(self.THIS)
+            return True
+        return False
 
     def reload(self):
         sel = self.session_cb.get()
@@ -3813,7 +3875,9 @@ class HistoryWindow:
         self.render(scroll_end=True)
 
     def _live(self, entries):
-        if self.session_cb.get() == self.THIS:
+        if self.refresh_sessions():  # an old log just deleted itself while it was being read
+            self.reload()
+        elif self.session_cb.get() == self.THIS:
             self.entries = list(entries)
             at_end = self.text.yview()[1] > 0.98
             self.render(scroll_end=at_end)
@@ -3868,8 +3932,6 @@ class HistoryWindow:
                 end = f"{pos}+{len(q)}c"
                 t.tag_add("hit", pos, end)
                 start = end
-        n, total = len(self.shown), len(self.entries)
-        self.count.set(f"{n} of {total} lines" if q else f"{total} lines")
         if not self.entries:
             t.insert("end", "Nothing here yet - translated lines show up as they happen.", "time")
         if scroll_end:
@@ -3878,20 +3940,8 @@ class HistoryWindow:
             t.yview_moveto(y)
 
     # ---- buttons ----
-    def _save_toggled(self):
-        self.cfg["save_history"] = bool(self.save_var.get())
-        save_settings(self.cfg)
-
     def _as_text(self):
         return "\n".join(format_entry(e) for e in self.shown)
-
-    def copy(self):
-        try:
-            sel = self.text.get("sel.first", "sel.last")
-        except Exception:
-            sel = self._as_text()
-        self.win.clipboard_clear()
-        self.win.clipboard_append(sel)
 
     def export(self):
         from tkinter import filedialog
@@ -3904,17 +3954,11 @@ class HistoryWindow:
             with open(path, "w", encoding="utf-8") as f:
                 f.write(self._as_text())
 
-    def open_folder(self):
-        os.makedirs(HISTORY_DIR, exist_ok=True)
-        if sys.platform == "win32":
-            os.startfile(HISTORY_DIR)
-        else:
-            subprocess.Popen(["xdg-open", HISTORY_DIR])
-
     def show(self):
         self.win.deiconify()
         self.win.lift()
-        self.refresh_sessions()
+        if self.refresh_sessions():
+            self.reload()
 
     def close(self):
         if self._live in self.history.listeners:
