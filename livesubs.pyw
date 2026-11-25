@@ -98,6 +98,85 @@ LANGUAGES = [
 LANG_NAME = {code: name for name, code in LANGUAGES if code}
 LANG_NAME["other"] = "Other language"  # Latin-script speech that isn't English, language not set
 SENSEVOICE_LANGS = {"zh", "yue", "ko", "ja", "en"}
+EAST_ASIAN = {"zh", "yue", "ja", "ko"}
+LATIN_SCRIPT = {"en", "es", "fr", "de", "pt", "it", "id", "tr", "pl", "nl", "tl", "vi",
+                "ms", "sv", "da", "fi", "cs", "ro", "hu"}
+
+
+def spoken_label(code):
+    """How a choice appears under Spoken language. English is always allowed next to the language
+    picked, because people mix it in (English words in Mandarin, an English-speaking teammate...)."""
+    if not code:
+        return "Auto-detect"
+    return "English only" if code == "en" else f"{LANG_NAME[code]} + English"
+
+
+def allowed_languages(picked):
+    """What speech can be recognised as: the language picked under Spoken language, plus English.
+    None = any language (auto-detect)."""
+    return {picked, "en"} if picked else None
+
+
+# The languages of the last few dozen clear lines this run of LiveSubs has heard (for auto-detect)
+HEARD_LANGUAGES = collections.deque(maxlen=40)
+
+
+def note_language(text, lang):
+    """Counts a finished line towards the languages being spoken, if it's long enough to be sure of
+    (short lines are the ones that get the wrong language)."""
+    cjk = len(re.findall(r"[\u3040-\u30ff\u3400-\u9fff\uac00-\ud7af]", text))
+    words = len(re.findall(r"[^\W\d_\u3040-\u30ff\u3400-\u9fff\uac00-\ud7af]{2,}", text))
+    if lang and lang != "other" and (cjk >= 6 or words >= 4):
+        HEARD_LANGUAGES.append(lang)
+
+
+def usual_languages():
+    """The languages being spoken, most heard first: each one at least 2 of the recent clear lines and
+    at least 15% of them, so a few early mistakes fade out."""
+    heard = list(HEARD_LANGUAGES)  # (lines are added from two threads)
+    return [c for c, n in collections.Counter(heard).most_common() if n >= 2 and n >= 0.15 * len(heard)]
+
+
+def language_family(code):
+    """Languages that get taken for one another: Mandarin, Cantonese, Japanese and Korean; English and
+    the other European languages; Russian and Ukrainian."""
+    return next((f for f in (EAST_ASIAN, LATIN_SCRIPT, {"ru", "uk"}) if code in f), {code})
+
+
+def closest_expected(heard, expect, strict):
+    """Without Qwen3-ASR's odds: a guess at what speech heard as `heard` (not expected) really was,
+    or None to keep it as heard."""
+    same = [c for c in expect if c in language_family(heard)]
+    if same:  # e.g. Mandarin heard as Cantonese, Japanese or Korean, or English heard as German
+        return same[0]
+    return expect[0] if strict and expect else None
+
+
+def name_odds(top, code):
+    """Qwen3-ASR's log-odds for language `code` where it names the language: the best of the candidate
+    tokens that are its name or the start of it (' Cant' for Cantonese). None if it isn't a candidate."""
+    names = [n for n, c in QWEN3_LANGS.items() if c == code]
+    best = None
+    for t in top:
+        piece = (t.get("token") or "").strip().lower()
+        if piece and any(n == piece or (len(piece) >= 3 and n.startswith(piece)) for n in names):
+            best = t["logprob"] if best is None else max(best, t["logprob"])
+    return best
+
+
+def fits_language(text, det, picked):
+    """Could this line be in the picked Spoken language or English? Judged by its writing, so
+    Chinese characters alone fit Mandarin, Cantonese and Japanese alike."""
+    if not picked or not has_foreign_script(text):  # plain Latin letters: English at least
+        return True
+    lang = text_language(text, det or picked)
+    if lang in (picked, "en"):
+        return True
+    if lang in ("zh", "yue"):
+        return picked in ("zh", "yue", "ja")
+    if lang in ("ru", "uk"):
+        return picked in ("ru", "uk")
+    return False
 
 # Windows fonts that actually contain each script's characters.
 SCRIPT_FONTS = {
@@ -126,6 +205,7 @@ DEFAULTS = {
     "click_through": False, "autostart": True, "pos": None,
     "history": 2, "speakers": True, "layout_v": 2,
     "game_mode": True, "target": "en", "both_ways": False,
+    "heard_languages": [],  # languages of recent clear lines, so auto-detect knows them from the start
 }
 
 # Chat logs of this many sessions stay on disk (a session = each time LiveSubs is opened);
@@ -359,6 +439,9 @@ def load_settings():
         cfg["translator"] = DEFAULTS["translator"]
     if cfg.get("target") not in dict(TARGETS).values():
         cfg["target"] = "en"
+    heard = cfg.get("heard_languages")
+    cfg["heard_languages"] = ([c for c in heard if isinstance(c, str) and c in LANG_NAME][-40:]
+                              if isinstance(heard, list) else [])
     if saved and saved.get("asr_v", 1) < 2 and cfg["engine"] == "sensevoice":
         cfg["engine"] = "qwen3"  # one-time switch to the more accurate two-pass speech recognition
     cfg["asr_v"] = 2
@@ -1243,7 +1326,10 @@ class Qwen3Refiner:
             text = (s.result.text or "").strip()
         return trusted_asr_text(text, len(audio16) / WHISPER_SR)
 
-    refine = transcribe  # second-listen interface (same as Qwen3GpuASR.refine)
+    def refine(self, audio16, expect=None, strict=True):
+        """Second-listen interface, like Qwen3GpuASR.refine. This version can't be told which language
+        to expect or say which one it heard, so the caller checks the writing instead."""
+        return self.transcribe(audio16), ""
 
 
 def trusted_asr_text(text, seconds):
@@ -1264,6 +1350,13 @@ QWEN3_LANGS = {
     "hebrew": "he", "malay": "ms", "swedish": "sv", "danish": "da", "finnish": "fi", "czech": "cs",
     "persian": "fa", "romanian": "ro", "hungarian": "hu", "macedonian": "mk",
 }
+# Qwen3-ASR can be told which language to write (not Ukrainian or Hebrew: it doesn't know them)
+QWEN3_FORCE = {
+    "zh": "Chinese", "en": "English", "yue": "Cantonese", "ja": "Japanese", "ko": "Korean", "es": "Spanish",
+    "fr": "French", "de": "German", "ru": "Russian", "pt": "Portuguese", "it": "Italian", "ar": "Arabic",
+    "hi": "Hindi", "th": "Thai", "vi": "Vietnamese", "id": "Indonesian", "tr": "Turkish", "pl": "Polish",
+    "nl": "Dutch", "tl": "Filipino", "el": "Greek",
+}
 
 
 def parse_qwen3_asr(reply):
@@ -1281,6 +1374,14 @@ def parse_qwen3_asr(reply):
         text = ""  # only a language tag: nothing was said
     text = text.replace("</asr_text>", "").strip()
     return text, lang
+
+
+def plain_asr_text(reply):
+    """Qwen3-ASR's reply when it was told the language: just the words."""
+    text = re.sub(r"<think>.*?</think>", "", reply or "", flags=re.S)
+    if "<asr_text>" in text:  # it named a language anyway
+        text = text.split("<asr_text>", 1)[1]
+    return text.replace("</asr_text>", "").strip()
 
 
 def wav_base64(audio16):
@@ -1318,18 +1419,34 @@ class Qwen3GpuASR:
         self.failures = 0
         self.listen(np.zeros(WHISPER_SR, np.float32), raise_errors=True)  # warm-up: the engine answers
 
-    def listen(self, audio16, raise_errors=False):
-        """(text, language code) - text is '' for no speech, noise or an untrustworthy result."""
+    # On auto-detect, speech heard as a language that isn't expected is kept only if Qwen3-ASR is at
+    # least 100 times surer of it than of every expected language (log-odds difference)
+    NEW_LANGUAGE_MARGIN = 4.6
+
+    def listen(self, audio16, expect=None, strict=True, raise_errors=False):
+        """(text, language code) - text is '' for no speech, noise or an untrustworthy result.
+        expect: the languages the speech should be in (None = any). Speech heard as another one
+        (Mandarin taken for Cantonese or Japanese, say) is listened to again, told which expected
+        language to write: always when strict (a Spoken language was picked), and on auto-detect
+        unless Qwen3-ASR is far surer of the language it heard, i.e. a new language really is spoken."""
         audio16 = audio16[:WHISPER_SR * 30]
         seconds = len(audio16) / WHISPER_SR
+        max_tokens = int(min(400, 40 + 12 * seconds))
         messages = []
         if self.words:  # Qwen3-ASR reads the system text as context: these names/terms get heard right
             messages.append({"role": "system", "content": ", ".join(self.words)})
         messages.append({"role": "user", "content": [
             {"type": "input_audio", "input_audio": {"data": wav_base64(audio16), "format": "wav"}}]})
         try:
-            reply = ASR_HOST.chat(ASR_MODEL, messages, max_tokens=int(min(400, 40 + 12 * seconds)),
-                                  temperature=0.0, timeout=30)
+            text, lang = parse_qwen3_asr(self._ask(messages, max_tokens))
+            if expect and text and lang and lang not in expect:
+                redo = self._recheck(messages, expect, strict, lang)
+                if redo:
+                    # the reply starts the way Qwen3-ASR's own "language=" option makes it start
+                    reply = self._ask(messages + [{"role": "assistant",
+                                                   "content": f"language {QWEN3_FORCE[redo]}<asr_text>"}], max_tokens)
+                    log(f"  heard as {LANG_NAME.get(lang, lang)}, listened again as {LANG_NAME[redo]}")
+                    text, lang = plain_asr_text(reply), redo
             self.failures = 0
         except Exception as e:
             if raise_errors:
@@ -1340,17 +1457,51 @@ class Qwen3GpuASR:
                 ASR_HOST.stop()
                 self.failures = 0
             return "", ""
-        text, lang = parse_qwen3_asr(reply)
         return trusted_asr_text(text, seconds), lang
 
-    def transcribe(self, audio16, language="", final=True):
+    @staticmethod
+    def _ask(messages, max_tokens, **kw):
+        return ASR_HOST.chat(ASR_MODEL, messages, max_tokens=max_tokens, temperature=0.0, timeout=30, **kw)
+
+    def _recheck(self, messages, expect, strict, heard):
+        """The expected language to listen again as, or None to keep what was heard. Decided by
+        Qwen3-ASR's own odds for each language, at the point where it names the language."""
+        if strict and any(c not in QWEN3_FORCE for c in expect):
+            return None  # it can't be told the language picked (Ukrainian, Hebrew), so leave it be
+        choices = [c for c in expect if c in QWEN3_FORCE]
+        if not strict:  # auto-detect: only a mix-up with a similar language is fixed
+            choices = [c for c in choices if c in language_family(heard)]
+        if not choices:
+            return None
+        try:
+            res = self._ask(messages + [{"role": "assistant", "content": "language"}], 1,
+                            extra={"logprobs": True, "top_logprobs": 20}, full=True)
+            top = res["choices"][0]["logprobs"]["content"][0]["top_logprobs"]
+        except Exception as e:
+            log("Qwen3-ASR's language odds unavailable:", e)
+            top = None
+        if not top:
+            guess = closest_expected(heard, choices, strict)
+            return guess if guess in QWEN3_FORCE else None
+        odds = {c: name_odds(top, c) for c in choices}
+        odds = {c: lp for c, lp in odds.items() if lp is not None}
+        if not odds:  # none of the expected languages is even in the running
+            return closest_expected(heard, choices, True) if strict else None
+        best = max(odds, key=odds.get)
+        if strict:
+            return best
+        sure = max(t["logprob"] for t in top)  # the language it heard is its first choice
+        return None if sure - odds[best] >= self.NEW_LANGUAGE_MARGIN else best
+
+    def transcribe(self, audio16, language="", final=True, expect=None, strict=True):
         """Speech-model interface (Game mode: the only recognizer). Returns (text, language code)."""
-        text, lang = self.listen(audio16)
+        text, lang = self.listen(audio16, expect, strict)
         return text, lang or text_language(text, "en")
 
-    def refine(self, audio16):
-        """Second-listen interface (outside Game mode, after SenseVoice's quick version)."""
-        return self.listen(audio16)[0]
+    def refine(self, audio16, expect=None, strict=True):
+        """Second-listen interface (outside Game mode, after SenseVoice's quick version):
+        (text, language code)."""
+        return self.listen(audio16, expect, strict)
 
 
 class SpeechGate:
@@ -1449,10 +1600,24 @@ class WhisperASR:
             vad_filter=True, condition_on_previous_text=False, without_timestamps=True,
         )
         text = " ".join(s.text.strip() for s in segs).strip()
-        return ("" if is_junk(text) else text), info.language
+        return ("" if is_junk(text) else text), info.language, info
 
-    def transcribe(self, audio16, language, final):
-        return self._run(audio16, "transcribe", language, final)
+    def transcribe(self, audio16, language, final, expect=None):
+        """language: the Spoken language picked. The speech can be that or English: Whisper decides
+        which, and has to pick one of the two if it heard something else. On auto-detect (language
+        ''), expect lists the languages usually heard: a similar one is kept only if Whisper is
+        100 times surer of it than of each of them (Mandarin taken for Cantonese, say)."""
+        if language == "en":
+            return self._run(audio16, "transcribe", "en", final)[:2]
+        text, lang, info = self._run(audio16, "transcribe", "", final)
+        allowed = allowed_languages(language)
+        expected = allowed or {c for c in (expect or ()) if c in language_family(lang)}
+        if expected and lang not in expected:
+            odds = dict(getattr(info, "all_language_probs", None) or [])
+            best = max(sorted(expected), key=lambda c: odds.get(c, 0.0))
+            if allowed or odds.get(lang, 1.0) < 100 * odds.get(best, 0.0):
+                text, lang, _ = self._run(audio16, "transcribe", best, final)
+        return text, lang
 
     def translate(self, audio16, language):
         return self._run(audio16, "translate", language, True)[0]
@@ -1793,21 +1958,26 @@ class LlamaHost:
             set_priority(self.proc.pid, on)
             set_gpu_priority(self.proc, on)
 
-    def chat(self, key, messages, max_tokens=300, temperature=0.2, timeout=60, status=log, on_text=None):
-        """on_text(text_so_far) is called as the reply streams in, if given."""
+    def chat(self, key, messages, max_tokens=300, temperature=0.2, timeout=60, status=log, on_text=None,
+             extra=None, full=False):
+        """on_text(text_so_far) is called as the reply streams in, if given. A last message from the
+        assistant is the start of the reply, which the model carries on from. extra: more request
+        fields; full=True returns the whole response rather than just the text."""
         with self.lock:
             self.use(key, status)
-            body = json.dumps({
+            body = {
                 "messages": messages, "max_tokens": max_tokens, "temperature": temperature,
                 "chat_template_kwargs": {"enable_thinking": False}, "cache_prompt": True,
                 "stream": on_text is not None,
-            }).encode()
-            req = urllib.request.Request(f"http://127.0.0.1:{self.port}/v1/chat/completions", data=body,
+            }
+            body.update(extra or {})
+            req = urllib.request.Request(f"http://127.0.0.1:{self.port}/v1/chat/completions",
+                                         data=json.dumps(body).encode(),
                                          headers={"Content-Type": "application/json"})
             with urllib.request.urlopen(req, timeout=timeout) as r:
                 if on_text is None:
                     res = json.loads(r.read().decode())
-                    return res["choices"][0]["message"].get("content") or ""
+                    return res if full else res["choices"][0]["message"].get("content") or ""
                 acc = ""
                 for raw in r:
                     line = raw.decode("utf-8", "replace").strip()
@@ -2108,10 +2278,45 @@ class Listener(threading.Thread):
 
     # ---- language setting ----
     def language(self):
+        """The language hint for the speech model: the Spoken language picked. On auto-detect,
+        SenseVoice gets the Chinese/Japanese/Korean language usually heard, so a line it takes for
+        another of those (Mandarin taken for Cantonese) is read again as that one."""
         lang = self.cfg.get("language") or ""
+        if not lang and self.asr.kind == "sensevoice":
+            lang = next((c for c in self.expected()[0] if c in EAST_ASIAN), "")
         if self.asr.kind == "sensevoice" and lang not in SENSEVOICE_LANGS:
             return ""
         return lang
+
+    def expected(self):
+        """(languages, strict): what speech should be in. A picked Spoken language allows only it and
+        English (strict). Auto-detect expects the languages this run has been hearing (none at first);
+        others get through when the second listen is sure of them."""
+        picked = self.cfg.get("language") or ""
+        if picked:
+            return ([picked, "en"] if picked != "en" else ["en"]), True
+        return usual_languages(), False
+
+    def _transcribe(self, audio16, final):
+        if self.asr.kind == "qwen3gpu":
+            expect, strict = self.expected()
+            return self.asr.transcribe(audio16, final=final, expect=expect, strict=strict)
+        if self.asr.kind == "whisper":
+            return self.asr.transcribe(audio16, self.language(), final, expect=self.expected()[0])
+        return self.asr.transcribe(audio16, self.language(), final)
+
+    def _quick_ok(self, text, det):
+        """Can a line be shown as it was first heard? Not if it's in a language the speech isn't
+        expected in (SenseVoice guesses from the first second or so, and often takes Mandarin for
+        Cantonese): the second listen decides. With nothing to check it with, it's shown on
+        auto-detect, and dropped when a Spoken language was picked."""
+        expect, strict = self.expected()
+        if strict:
+            return fits_language(text, det, expect[0])
+        if not expect or getattr(self.asr, "refiner", None) is None:
+            return True
+        lang = text_language(text, det)
+        return lang not in EAST_ASIAN or lang in expect
 
     def fast_pass_ok(self):
         """SenseVoice only knows 5 languages; for others (Spanish, French...) only Qwen3-ASR is used."""
@@ -2123,15 +2328,24 @@ class Listener(threading.Thread):
         line_id, self.utt_id = self.utt_id or next(_line_ids), None
         refiner = getattr(self.asr, "refiner", None)
         if self.fast_pass_ok():
-            text, det = self.asr.transcribe(audio16, self.language(), True)
+            text, det = self._transcribe(audio16, True)
         else:
             text, det = "", self.cfg.get("language") or "en"
+        # A line in a language the speech isn't expected in isn't shown: the second listen decides.
+        # (Even when told the language, SenseVoice writes Japanese or Korean when it's sure enough.)
+        unfit = bool(text) and not self._quick_ok(text, det)
+        if unfit:
+            log(f"  not in the languages expected, not shown yet: {text!r}")
+            text = ""
         if not text and not refiner:
             self.out.put(("dropped", line_id))
             return
         spk = self.speakers.identify(audio16) if self.speakers and self.cfg.get("speakers", True) else None
         if not refiner:
             self._publish("final", line_id, text, det, spk, audio16)
+            return
+        if unfit:
+            self.refine_q.put((line_id, audio16, "", det, spk, False))
             return
         # Two-pass: show the quick version now if it looks like real speech, then let Qwen3-ASR
         # re-listen in the background and correct (or remove) it.
@@ -2158,11 +2372,18 @@ class Listener(threading.Thread):
         judged from what was actually said."""
         if self.asr.kind == "whisper":
             return det, caption_target(text, det, self.cfg, trust=True)
+        picked = self.cfg.get("language") or ""
         trusted = self._trusted_language()
-        lang = text_language(text, trusted or det)
+        trust = bool(trusted)
+        lang = text_language(text, det if picked and det in (picked, "en") else (trusted or det))
         if lang == "en" and needs_translation(text, "en"):
-            lang = "other"  # Latin letters but not English (Spanish, French...) with no language picked
-        return lang, caption_target(text, lang, self.cfg, trust=bool(trusted))
+            if not picked:
+                lang = "other"  # Latin letters but not English (Spanish, French...) with no language picked
+            elif picked in LATIN_SCRIPT:
+                lang = picked  # not English, so the other language picked
+            else:
+                trust = True  # of the two languages picked, only English is written in these letters
+        return lang, caption_target(text, lang, self.cfg, trust=trust)
 
     def _wants_translation(self, to):
         if to is None or self.cfg["show"] == "original":
@@ -2181,8 +2402,18 @@ class Listener(threading.Thread):
                     text = quick  # falling behind: skip the slow second listen for this line
                 else:
                     t0 = time.monotonic()
-                    text = self.asr.refiner.refine(audio16)
+                    expect, strict = self.expected()
+                    text, heard = self.asr.refiner.refine(audio16, expect, strict)
                     log(f"  second listen ({(time.monotonic() - t0) * 1000:.0f} ms): {text!r}  (quick: {quick!r})")
+                    if strict and text and not fits_language(text, heard or det, expect[0]):
+                        log("  second listen is in a language that wasn't picked: keeping the quick version")
+                        text = quick
+                    elif heard:
+                        det = heard
+                    elif text and det not in expect and text_language(text, det) in ("zh", "yue"):
+                        # the CPU second listen can't say which language it heard, and Chinese
+                        # characters look the same either way: go with the Chinese language expected
+                        det = next((c for c in expect if c in ("zh", "yue")), det)
             except Exception:
                 log(traceback.format_exc())
                 text = quick
@@ -2200,6 +2431,7 @@ class Listener(threading.Thread):
         wanted = self._wants_translation(to)
         self.out.put((kind, line_id, text, lang, wanted, spk, False))
         log(f"[{lang}] (speaker {spk}) {text}")
+        note_language(text, lang)
         if not wanted:
             return
         if self.translator.ready_model:
@@ -2309,8 +2541,8 @@ class Listener(threading.Thread):
             if now - last_run < self.asr.live_step or not self.fast_pass_ok():
                 continue
             last_run = now
-            text, det = self.asr.transcribe(to16k([ch for ch, _ in chunks]), self.language(), False)
-            if text:
+            text, det = self._transcribe(to16k([ch for ch, _ in chunks]), False)
+            if text and self._quick_ok(text, det):
                 lang, to = self._classify(text, det)
                 if self.cfg.get("hide_english") and to is None:
                     continue  # don't flash up a line that's going to be hidden anyway
@@ -3976,6 +4208,7 @@ class App:
 
         self.tk, self.ttk = tk, ttk
         self.cfg = load_settings()
+        HEARD_LANGUAGES.extend(self.cfg["heard_languages"])
         self.q = queue.Queue()
         self.asr = None
         self.speakers = None
@@ -4101,8 +4334,8 @@ class App:
 
         # Language
         row(8, "Spoken language")
-        self.lang_cb = ttk.Combobox(f, values=[n for n, _ in LANGUAGES], state="readonly")
-        self.lang_cb.set(next((n for n, code in LANGUAGES if code == c["language"]), "Auto-detect"))
+        self.lang_cb = ttk.Combobox(f, values=[spoken_label(code) for _, code in LANGUAGES], state="readonly")
+        self.lang_cb.set(spoken_label(c["language"] if c["language"] in dict(LANGUAGES).values() else ""))
         self.lang_cb.grid(row=8, column=1, sticky="ew")
         self.lang_cb.bind("<<ComboboxSelected>>", lambda e: self.simple_changed())
 
@@ -4453,7 +4686,7 @@ class App:
             pass
 
     def simple_changed(self):
-        self.cfg["language"] = dict(LANGUAGES).get(self.lang_cb.get(), "")
+        self.cfg["language"] = {spoken_label(code): code for _, code in LANGUAGES}.get(self.lang_cb.get(), "")
         self.cfg["show"] = SHOW_MODES.get(self.show_cb.get(), "both")
         self.cfg["autostart"] = bool(self.auto_var.get())
         save_settings(self.cfg)
@@ -4708,6 +4941,7 @@ class App:
     def quit(self):
         lst = self.listener
         self.stop_listening()
+        self.cfg["heard_languages"] = list(HEARD_LANGUAGES)
         save_settings(self.cfg)
         if lst:
             lst.join(timeout=1.5)

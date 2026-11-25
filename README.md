@@ -103,10 +103,16 @@ before. Older chat logs delete themselves.
 
 ## Tips for better accuracy
 
+- **Spoken language:** *Auto-detect* (the default) learns which languages it's hearing. Once a language
+  has come up in a couple of clear lines, a short or unclear line that sounds like a similar language
+  (Mandarin taken for Cantonese, Japanese or Korean, English taken for German) is read again as the
+  usual one. Another language still shows when the speech model is sure of it. It remembers the usual
+  languages for next time. To allow only certain languages, pick one, e.g. *Chinese (Mandarin) +
+  English*: speech is then only ever written as that language or English, and anything else is left
+  out. Pick *English only* if nobody speaks anything else.
 - **Topic:** describe what you're watching, e.g. *"Valorant ranked, Chinese and English teammates"*.
 - **Custom words:** list names and terms, separated by commas (agent names, callouts, friends' names).
   These steer both the speech recognition and the translation.
-- **Spoken language:** set it if you know the language, instead of auto-detect.
 - **Listen to:** choose *Only these apps…* to ignore music and other programs.
 
 ## Playing games
